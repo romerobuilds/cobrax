@@ -1,0 +1,187 @@
+# app/workers/tasks.py
+from __future__ import annotations
+
+from datetime import datetime, timezone, timedelta
+
+from app.workers.celery_app import celery_app
+from app.database_.database import SessionLocal
+from app.models.email_log import EmailLog
+from app.models.company import Company
+from app.models.plan import Plan
+from app.services.mailer import send_smtp_email
+from app.workers.rate_limiter import throttle_company
+
+
+def _same_utc_day(dt) -> bool:
+    """Retorna True se dt está no mesmo dia (UTC) do 'agora'."""
+    if not dt:
+        return False
+    return dt.astimezone(timezone.utc).date() == datetime.now(timezone.utc).date()
+
+
+def _seconds_until_next_utc_0005(now_utc: datetime) -> int:
+    """
+    Calcula quantos segundos faltam até 00:05 UTC do próximo dia.
+    Usa mínimo de 60s para evitar retry imediato.
+    """
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+
+    next_day_date = (now_utc.date() + timedelta(days=1))
+    next_run = datetime.combine(next_day_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(minutes=5)
+    seconds = int((next_run - now_utc).total_seconds())
+    return max(60, seconds)
+
+
+@celery_app.task(
+    bind=True,
+    max_retries=3,
+    autoretry_for=(Exception,),
+    retry_backoff=True,        # 1m, 2m, 4m...
+    retry_backoff_max=300,     # máx 5 min
+    retry_jitter=True,
+)
+def send_email_job(self, log_id: str):
+    db = SessionLocal()
+    try:
+        log: EmailLog | None = db.query(EmailLog).filter(EmailLog.id == log_id).first()
+        if not log:
+            return
+
+        # ✅ cancelado? ignora
+        if getattr(log, "cancelled_at", None) is not None or log.status == "CANCELLED":
+            return
+
+        company: Company | None = db.query(Company).filter(Company.id == log.company_id).first()
+        if not company:
+            log.status = "FAILED"
+            log.error_message = "Company not found"
+            db.commit()
+            return
+
+        # ✅ carrega plano (se houver)
+        plan: Plan | None = None
+        if getattr(company, "plan_id", None):
+            plan = db.query(Plan).filter(Plan.id == company.plan_id).first()
+
+        # ✅ SMTP pausado: não é erro, deixa pendente
+        if getattr(company, "smtp_paused", False):
+            log.status = "PENDING"
+            log.error_message = "SMTP pausado"
+            db.commit()
+            return
+
+        # ✅ validações mínimas
+        if not log.to_email:
+            log.status = "FAILED"
+            log.error_message = "Log sem to_email"
+            db.commit()
+            return
+
+        required = [company.smtp_host, company.smtp_port, company.from_email, company.from_name]
+        if any(x is None for x in required):
+            log.status = "FAILED"
+            log.error_message = "SMTP config incompleta na company"
+            db.commit()
+            return
+
+        now = datetime.now(timezone.utc)
+
+        # ✅ reset contador diário (UTC)
+        if not _same_utc_day(getattr(company, "emails_sent_today_at", None)):
+            company.emails_sent_today = 0
+            company.emails_sent_today_at = now
+            db.commit()
+
+        # ✅ daily_limit: company override > plan > None (None = ilimitado)
+        daily_limit = getattr(company, "daily_email_limit", None)
+        if daily_limit is None and plan is not None:
+            daily_limit = getattr(plan, "daily_email_limit", None)
+
+        sent_today = getattr(company, "emails_sent_today", 0) or 0
+
+        # ✅ bateu limite diário? NÃO FAIL. Marca DEFERRED e reagenda pro próximo dia (UTC)
+        if daily_limit is not None and sent_today >= int(daily_limit):
+            log.status = "DEFERRED"
+            log.error_message = f"Limite diário atingido ({sent_today}/{daily_limit}) - reagendado para amanhã (UTC)"
+            db.commit()
+
+            countdown = _seconds_until_next_utc_0005(now)
+            raise self.retry(countdown=countdown)
+
+        # ✅ rate_per_min: company override > plan > default
+        rate_per_min = getattr(company, "rate_per_min", None)
+        if rate_per_min is None and plan is not None:
+            rate_per_min = getattr(plan, "rate_per_min", None)
+        if rate_per_min is None:
+            rate_per_min = 20
+
+        rate_per_min = int(rate_per_min)
+
+        ok = throttle_company(str(company.id), rate_per_min, spin_seconds=8.0)
+        if not ok:
+            # não liberou dentro do spin -> reenqueue rápido
+            raise self.retry(countdown=3)
+
+        # ✅ marca tentativa
+        log.attempt_count = (log.attempt_count or 0) + 1
+        log.last_attempt_at = now
+        log.status = "SENDING"
+        log.error_message = None
+        db.commit()
+
+        # ✅ checagem final (cancel/pause entre throttle e envio)
+        db.refresh(log)
+        db.refresh(company)
+
+        if getattr(log, "cancelled_at", None) is not None or log.status == "CANCELLED":
+            return
+
+        if getattr(company, "smtp_paused", False):
+            log.status = "PENDING"
+            log.error_message = "SMTP pausado"
+            db.commit()
+            return
+
+        # ✅ envia
+        send_smtp_email(
+            smtp_host=company.smtp_host,
+            smtp_port=company.smtp_port,
+            smtp_user=company.smtp_user or "",
+            smtp_password=company.smtp_password or "",
+            use_tls=bool(company.smtp_use_tls),
+            from_email=company.from_email,
+            from_name=company.from_name,
+            to_email=log.to_email,
+            subject=log.subject_rendered or "(sem assunto)",
+            body_text=log.body_rendered or "",
+        )
+
+        # ✅ sucesso: incrementa contador diário
+        company.emails_sent_today = (getattr(company, "emails_sent_today", 0) or 0) + 1
+        company.emails_sent_today_at = now
+
+        log.status = "SENT"
+        log.sent_at = now
+        log.error_message = None
+        db.commit()
+
+    except Exception as e:
+        # ⚠️ Se estiver cancelado, não marca nada
+        try:
+            log2 = db.query(EmailLog).filter(EmailLog.id == log_id).first()
+            if log2:
+                if getattr(log2, "cancelled_at", None) is not None or log2.status == "CANCELLED":
+                    return
+
+                retries_left = self.max_retries - self.request.retries
+                log2.status = "RETRYING" if retries_left > 0 else "FAILED"
+                log2.error_message = str(e)
+                db.commit()
+        except Exception:
+            pass
+
+        raise
+
+    finally:
+        db.close()

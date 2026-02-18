@@ -14,17 +14,33 @@ from app.routes import email_send_bulk
 from app.routes.email_admin import router as email_admin_router
 from app.routes.plan_admin import router as plan_admin_router
 from app.routes.worker_status import router as worker_status_router
-
-
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title="COBRAX",
     description="Sistema de automação de cobranças",
-    version="0.1.0"
+    version="0.1.0",
 )
 
+origins = [
+    "http://95.216.138.163",
+    "http://95.216.138.163:5173",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+
 # @app.on_event("startup")
-# def on_startup():
+# def startup():
 #     Base.metadata.create_all(bind=engine)
 
 app.include_router(health_router)

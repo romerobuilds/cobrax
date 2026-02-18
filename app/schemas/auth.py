@@ -1,4 +1,5 @@
-from pydantic import BaseModel, EmailStr, Field
+from uuid import UUID
+from pydantic import BaseModel, EmailStr, Field, ConfigDict
 
 class UserCreate(BaseModel):
     email: EmailStr
@@ -6,8 +7,10 @@ class UserCreate(BaseModel):
     senha: str = Field(min_length=6, max_length=72)
 
 class UserPublic(BaseModel):
-    id: str
-    email: EmailStr
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    email: str
     nome: str
 
 class Token(BaseModel):

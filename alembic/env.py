@@ -17,7 +17,7 @@ DATABASE_URL = os.getenv(
     "postgresql+psycopg2://cobrax:cobrax123@localhost:5432/cobrax"
 )
 
-config.set_main_option("sqlalchemy.url", DATABASE_URL)
+config.set_main_option("sqlalchemy.url", DATABASE_URL.replace("%", "%%"))
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.

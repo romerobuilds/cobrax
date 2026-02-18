@@ -1,6 +1,10 @@
 # app/workers/tasks.py
 from __future__ import annotations
+
 from datetime import datetime, timezone, timedelta
+
+from sqlalchemy import func
+
 from app.workers.celery_app import celery_app
 from app.database_.database import SessionLocal
 from app.models.email_log import EmailLog
@@ -8,12 +12,10 @@ from app.models.company import Company
 from app.models.plan import Plan
 from app.services.mailer import send_smtp_email
 from app.workers.rate_limiter import throttle_company
-from sqlalchemy import func
+
+# Campanhas (usados em totals + override rate)
 from app.models.campaign import Campaign
 from app.models.campaign_run import CampaignRun
-from app.models.campaign_target import CampaignTarget
-from app.models.client import Client
-from app.models.email_template import EmailTemplate
 
 
 def _same_utc_day(dt) -> bool:
@@ -31,10 +33,14 @@ def _seconds_until_next_utc_0005(now_utc: datetime) -> int:
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
 
-    next_day_date = (now_utc.date() + timedelta(days=1))
-    next_run = datetime.combine(next_day_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(minutes=5)
+    next_day_date = now_utc.date() + timedelta(days=1)
+    next_run = (
+        datetime.combine(next_day_date, datetime.min.time(), tzinfo=timezone.utc)
+        + timedelta(minutes=5)
+    )
     seconds = int((next_run - now_utc).total_seconds())
     return max(60, seconds)
+
 
 def _render_placeholders(text: str, ctx: dict) -> str:
     """
@@ -96,8 +102,8 @@ def _recompute_run_totals(db, run_id: str):
     bind=True,
     max_retries=3,
     autoretry_for=(Exception,),
-    retry_backoff=True,        # 1m, 2m, 4m...
-    retry_backoff_max=300,     # máx 5 min
+    retry_backoff=True,      # 1m, 2m, 4m...
+    retry_backoff_max=300,   # máx 5 min
     retry_jitter=True,
 )
 def send_email_job(self, log_id: str):
@@ -162,7 +168,9 @@ def send_email_job(self, log_id: str):
         # ✅ bateu limite diário? NÃO FAIL. Marca DEFERRED e reagenda pro próximo dia (UTC)
         if daily_limit is not None and sent_today >= int(daily_limit):
             log.status = "DEFERRED"
-            log.error_message = f"Limite diário atingido ({sent_today}/{daily_limit}) - reagendado para amanhã (UTC)"
+            log.error_message = (
+                f"Limite diário atingido ({sent_today}/{daily_limit}) - reagendado para amanhã (UTC)"
+            )
             db.commit()
 
             countdown = _seconds_until_next_utc_0005(now)
@@ -177,13 +185,11 @@ def send_email_job(self, log_id: str):
 
         rate_per_min = int(rate_per_min)
 
-                # ✅ campaign override de rate_per_min (se existir)
+        # ✅ campaign override de rate_per_min (se existir)
         if getattr(log, "campaign_id", None):
-            from app.models.campaign import Campaign
             camp = db.query(Campaign).filter(Campaign.id == log.campaign_id).first()
             if camp and getattr(camp, "rate_per_min", None):
                 rate_per_min = int(camp.rate_per_min)
-
 
         ok = throttle_company(str(company.id), rate_per_min, spin_seconds=8.0)
         if not ok:
@@ -232,12 +238,10 @@ def send_email_job(self, log_id: str):
         log.sent_at = now
         log.error_message = None
         db.commit()
-        
+
         # ✅ atualiza métricas da campanha
         if getattr(log, "campaign_run_id", None):
-            from app.workers.tasks import _recompute_run_totals
             _recompute_run_totals(db, str(log.campaign_run_id))
-
 
     except Exception as e:
         # ⚠️ Se estiver cancelado, não marca nada

@@ -15,6 +15,7 @@ from app.routes.email_admin import router as email_admin_router
 from app.routes.plan_admin import router as plan_admin_router
 from app.routes.worker_status import router as worker_status_router
 from fastapi.middleware.cors import CORSMiddleware
+from app.routers.campaign import router as campaigns_router
 
 app = FastAPI(
     title="COBRAX",
@@ -55,6 +56,7 @@ app.include_router(email_send_bulk.router)
 app.include_router(email_admin_router)
 app.include_router(plan_admin_router)
 app.include_router(worker_status_router)
+app.include_router(campaigns_router)
 
 
 

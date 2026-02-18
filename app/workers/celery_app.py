@@ -19,4 +19,10 @@ celery_app.conf.update(
     enable_utc=True,
 )
 
+celery_app.conf.beat_schedule = {
+    "check-scheduled-campaigns-every-minute": {
+        "task": "app.workers.scheduler.check_scheduled_campaigns",
+        "schedule": 60.0,
+    },
+}
 

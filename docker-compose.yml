@@ -45,5 +45,18 @@ services:
       - redis
     restart: unless-stopped
 
+  cobrax-beat:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    command: celery -A app.workers.celery_app.celery_app beat --loglevel=info
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    networks:
+      - default
+
 volumes:
   pgdata:

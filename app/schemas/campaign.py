@@ -3,22 +3,31 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
 
+# =============================
+# CREATE
+# =============================
+
 class CampaignCreate(BaseModel):
     name: str
-    template_id: str
+    template_id: UUID
     mode: str = Field(default="selected")  # selected | all | upload
     context: Dict[str, Any] = Field(default_factory=dict)
     rate_per_min: int = 15
     scheduled_at: Optional[datetime] = None
 
 
+# =============================
+# UPDATE
+# =============================
+
 class CampaignUpdate(BaseModel):
     name: Optional[str] = None
-    template_id: Optional[str] = None
+    template_id: Optional[UUID] = None
     status: Optional[str] = None  # draft | ready | running | done | ...
     mode: Optional[str] = None
     context: Optional[Dict[str, Any]] = None
@@ -26,11 +35,15 @@ class CampaignUpdate(BaseModel):
     scheduled_at: Optional[datetime] = None
 
 
+# =============================
+# OUTPUT
+# =============================
+
 class CampaignOut(BaseModel):
-    id: str
-    company_id: str
+    id: UUID
+    company_id: UUID
     name: str
-    template_id: str
+    template_id: UUID
     status: str
     mode: str
     context: Dict[str, Any]
@@ -39,11 +52,15 @@ class CampaignOut(BaseModel):
     created_at: datetime
 
     class Config:
-        from_attributes = True
+        from_attributes = True  # Pydantic v2 (equivalente ao orm_mode=True)
 
+
+# =============================
+# TARGETS
+# =============================
 
 class CampaignTargetAddSelected(BaseModel):
-    client_ids: List[str] = Field(default_factory=list)
+    client_ids: List[UUID] = Field(default_factory=list)
     payload: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -52,9 +69,13 @@ class CampaignTargetAddEmails(BaseModel):
     payload: Dict[str, Any] = Field(default_factory=dict)
 
 
+# =============================
+# RUN OUTPUT
+# =============================
+
 class CampaignRunOut(BaseModel):
-    id: str
-    campaign_id: str
+    id: UUID
+    campaign_id: UUID
     status: str
     started_at: datetime
     finished_at: Optional[datetime] = None

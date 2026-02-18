@@ -1,212 +1,344 @@
-from typing import List, Optional
-from uuid import UUID
+# app/routers/campaign.py
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Dict, List
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from sqlalchemy import func, desc
+from sqlalchemy import func
 
-from app.database_.database import get_db
-from app.models.campaign import Campaign
-from app.models.campaign_run import CampaignRun
-from app.models.campaign_target import CampaignTarget
+from app.database_.database import SessionLocal
 from app.schemas.campaign import (
     CampaignCreate,
     CampaignUpdate,
     CampaignOut,
-    CampaignDetailOut,
-    CampaignTargetsAdd,
-    CampaignTargetsAddResult,
+    CampaignTargetAddSelected,
+    CampaignTargetAddEmails,
     CampaignRunOut,
 )
+
+from app.models.campaign import Campaign
+from app.models.campaign_run import CampaignRun
+from app.models.campaign_target import CampaignTarget
+from app.models.client import Client
+from app.models.email_template import EmailTemplate
+from app.models.email_log import EmailLog
+
+from app.workers.tasks import send_email_job
+
 
 router = APIRouter(prefix="/empresas/{company_id}/campanhas", tags=["Campanhas"])
 
 
-def _ensure_company_campaign(db: Session, company_id: UUID, campaign_id: UUID) -> Campaign:
-    c = (
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def _render_placeholders(text: str, ctx: Dict[str, Any]) -> str:
+    if not text:
+        return ""
+    out = text
+    for k, v in (ctx or {}).items():
+        out = out.replace("{{" + str(k) + "}}", str(v))
+    return out
+
+
+def _ensure_campaign_company(db: Session, company_id: str, campaign_id: str) -> Campaign:
+    camp = (
         db.query(Campaign)
-        .filter(Campaign.company_id == company_id, Campaign.id == campaign_id)
+        .filter(Campaign.id == campaign_id, Campaign.company_id == company_id)
         .first()
     )
-    if not c:
-        raise HTTPException(status_code=404, detail="Campanha não encontrada para esta empresa.")
-    return c
-
-
-@router.post("/", response_model=CampaignOut)
-def create_campaign(company_id: UUID, payload: CampaignCreate, db: Session = Depends(get_db)):
-    c = Campaign(
-        company_id=company_id,
-        name=payload.name,
-        template_id=payload.template_id,
-        status="draft",
-        mode=payload.mode,
-        context=payload.context or {},
-        rate_per_min=int(payload.rate_per_min or 15),
-        scheduled_at=payload.scheduled_at,
-    )
-    db.add(c)
-    db.commit()
-    db.refresh(c)
-    return c
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return camp
 
 
 @router.get("/", response_model=List[CampaignOut])
-def list_campaigns(company_id: UUID, db: Session = Depends(get_db)):
-    return (
+def list_campaigns(company_id: str, db: Session = Depends(get_db)):
+    items = (
         db.query(Campaign)
         .filter(Campaign.company_id == company_id)
-        .order_by(desc(Campaign.created_at))
+        .order_by(Campaign.created_at.desc())
         .all()
     )
+    return items
 
 
-@router.get("/{campaign_id}", response_model=CampaignDetailOut)
-def get_campaign_detail(company_id: UUID, campaign_id: UUID, db: Session = Depends(get_db)):
-    c = _ensure_company_campaign(db, company_id, campaign_id)
+@router.post("/", response_model=CampaignOut)
+def create_campaign(company_id: str, body: CampaignCreate, db: Session = Depends(get_db)):
+    # valida template
+    tpl = db.query(EmailTemplate).filter(EmailTemplate.id == body.template_id).first()
+    if not tpl:
+        raise HTTPException(status_code=400, detail="template_id inválido")
 
-    targets_count = (
-        db.query(func.count(CampaignTarget.id))
-        .filter(CampaignTarget.campaign_id == campaign_id)
-        .scalar()
-    ) or 0
-
-    last_run = (
-        db.query(CampaignRun)
-        .filter(CampaignRun.campaign_id == campaign_id)
-        .order_by(desc(CampaignRun.started_at))
-        .first()
+    camp = Campaign(
+        company_id=company_id,
+        name=body.name,
+        template_id=body.template_id,
+        status="draft",
+        mode=body.mode or "selected",
+        context=body.context or {},
+        rate_per_min=int(body.rate_per_min or 15),
+        scheduled_at=body.scheduled_at,
     )
+    db.add(camp)
+    db.commit()
+    db.refresh(camp)
+    return camp
 
-    return {
-        "campaign": c,
-        "targets_count": int(targets_count),
-        "last_run": last_run,
-    }
+
+@router.get("/{campaign_id}", response_model=CampaignOut)
+def get_campaign(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
+    return _ensure_campaign_company(db, company_id, campaign_id)
 
 
 @router.patch("/{campaign_id}", response_model=CampaignOut)
-def update_campaign(company_id: UUID, campaign_id: UUID, payload: CampaignUpdate, db: Session = Depends(get_db)):
-    c = _ensure_company_campaign(db, company_id, campaign_id)
+def update_campaign(company_id: str, campaign_id: str, body: CampaignUpdate, db: Session = Depends(get_db)):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
 
-    data = payload.model_dump(exclude_unset=True)
+    data = body.model_dump(exclude_unset=True)
+    if "template_id" in data:
+        tpl = db.query(EmailTemplate).filter(EmailTemplate.id == data["template_id"]).first()
+        if not tpl:
+            raise HTTPException(status_code=400, detail="template_id inválido")
+
     for k, v in data.items():
-        setattr(c, k, v)
+        setattr(camp, k, v)
 
-    db.add(c)
     db.commit()
-    db.refresh(c)
-    return c
+    db.refresh(camp)
+    return camp
 
 
-@router.post("/{campaign_id}/targets", response_model=CampaignTargetsAddResult)
-def add_targets(company_id: UUID, campaign_id: UUID, payload: CampaignTargetsAdd, db: Session = Depends(get_db)):
-    _ = _ensure_company_campaign(db, company_id, campaign_id)
+@router.delete("/{campaign_id}")
+def delete_campaign(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
+    db.delete(camp)
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/{campaign_id}/targets/selected")
+def add_targets_selected(
+    company_id: str,
+    campaign_id: str,
+    body: CampaignTargetAddSelected,
+    db: Session = Depends(get_db),
+):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
 
     added = 0
-    skipped = 0
+    for cid in body.client_ids or []:
+        # valida client
+        c = db.query(Client).filter(Client.id == cid, Client.company_id == company_id).first()
+        if not c:
+            continue
 
-    def upsert_client(client_id: UUID, extra_payload: Optional[dict] = None):
-        nonlocal added, skipped
         exists = (
-            db.query(CampaignTarget.id)
-            .filter(CampaignTarget.campaign_id == campaign_id, CampaignTarget.client_id == client_id)
+            db.query(CampaignTarget)
+            .filter(CampaignTarget.campaign_id == camp.id, CampaignTarget.client_id == cid)
             .first()
         )
         if exists:
-            skipped += 1
-            return
+            continue
+
         t = CampaignTarget(
-            campaign_id=campaign_id,
-            client_id=client_id,
+            campaign_id=camp.id,
+            client_id=cid,
             email=None,
-            payload=extra_payload or {},
+            payload=body.payload or {},
         )
         db.add(t)
         added += 1
-
-    def upsert_email(email: str, extra_payload: Optional[dict] = None):
-        nonlocal added, skipped
-        email_l = email.strip().lower()
-        exists = (
-            db.query(CampaignTarget.id)
-            .filter(CampaignTarget.campaign_id == campaign_id, func.lower(CampaignTarget.email) == email_l)
-            .first()
-        )
-        if exists:
-            skipped += 1
-            return
-        t = CampaignTarget(
-            campaign_id=campaign_id,
-            client_id=None,
-            email=email,
-            payload=extra_payload or {},
-        )
-        db.add(t)
-        added += 1
-
-    if payload.client_ids:
-        for cid in payload.client_ids:
-            upsert_client(cid)
-
-    if payload.emails:
-        for em in payload.emails:
-            upsert_email(str(em))
-
-    if payload.targets:
-        for t in payload.targets:
-            if t.client_id:
-                upsert_client(t.client_id, t.payload or {})
-            elif t.email:
-                upsert_email(str(t.email), t.payload or {})
-            else:
-                skipped += 1
 
     db.commit()
+    return {"ok": True, "added": added}
 
-    total_now = (
-        db.query(func.count(CampaignTarget.id))
-        .filter(CampaignTarget.campaign_id == campaign_id)
-        .scalar()
-    ) or 0
 
-    return {"added": added, "skipped": skipped, "total_now": int(total_now)}
+@router.post("/{campaign_id}/targets/all")
+def add_targets_all(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
+
+    clients = db.query(Client).filter(Client.company_id == company_id).all()
+
+    added = 0
+    for c in clients:
+        exists = (
+            db.query(CampaignTarget)
+            .filter(CampaignTarget.campaign_id == camp.id, CampaignTarget.client_id == c.id)
+            .first()
+        )
+        if exists:
+            continue
+
+        t = CampaignTarget(
+            campaign_id=camp.id,
+            client_id=c.id,
+            email=None,
+            payload={},
+        )
+        db.add(t)
+        added += 1
+
+    db.commit()
+    return {"ok": True, "added": added}
+
+
+@router.post("/{campaign_id}/targets/emails")
+def add_targets_emails(
+    company_id: str,
+    campaign_id: str,
+    body: CampaignTargetAddEmails,
+    db: Session = Depends(get_db),
+):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
+
+    added = 0
+    for email in body.emails or []:
+        e = (email or "").strip()
+        if not e:
+            continue
+
+        exists = (
+            db.query(CampaignTarget)
+            .filter(CampaignTarget.campaign_id == camp.id)
+            .filter(func.lower(CampaignTarget.email) == func.lower(e))
+            .first()
+        )
+        if exists:
+            continue
+
+        t = CampaignTarget(
+            campaign_id=camp.id,
+            client_id=None,
+            email=e,
+            payload=body.payload or {},
+        )
+        db.add(t)
+        added += 1
+
+    db.commit()
+    return {"ok": True, "added": added}
 
 
 @router.post("/{campaign_id}/run", response_model=CampaignRunOut)
-def run_campaign(company_id: UUID, campaign_id: UUID, db: Session = Depends(get_db)):
-    c = _ensure_company_campaign(db, company_id, campaign_id)
+def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
 
-    # valida se tem targets
-    targets_count = (
-        db.query(func.count(CampaignTarget.id))
-        .filter(CampaignTarget.campaign_id == campaign_id)
-        .scalar()
-    ) or 0
-    if targets_count <= 0:
-        raise HTTPException(status_code=400, detail="Campanha sem targets. Adicione targets antes de rodar.")
+    if camp.status not in ("draft", "ready"):
+        # deixa passar running/done? aqui a gente bloqueia pra evitar duplicar sem querer
+        raise HTTPException(status_code=400, detail=f"Campanha em status inválido para iniciar: {camp.status}")
 
-    # cria run
-    run = CampaignRun(
-        campaign_id=campaign_id,
-        status="running",
-        totals={"total": int(targets_count), "sent": 0, "failed": 0, "pending": int(targets_count)},
-    )
+    tpl = db.query(EmailTemplate).filter(EmailTemplate.id == camp.template_id).first()
+    if not tpl:
+        raise HTTPException(status_code=400, detail="Template não encontrado")
+
+    targets = db.query(CampaignTarget).filter(CampaignTarget.campaign_id == camp.id).all()
+    if not targets:
+        raise HTTPException(status_code=400, detail="Campanha sem targets")
+
+    run = CampaignRun(campaign_id=camp.id, status="running", totals={})
     db.add(run)
-
-    # opcional: marca campanha como running
-    c.status = "running"
-    db.add(c)
-
+    camp.status = "running"
     db.commit()
     db.refresh(run)
 
-    # enfileirar (C: worker) — por enquanto já deixo plugado
-    # se você ainda não tiver a task, a gente cria jájá.
-    try:
-        from app.workers.celery_app import celery_app
-        celery_app.send_task("app.workers.tasks.run_campaign", args=[str(run.id)])
-    except Exception:
-        # não quebra a API por causa do enqueue (mas você vai ver nos logs)
-        pass
+    created_logs = 0
 
+    for t in targets:
+        to_email = None
+        to_name = None
+        ctx: Dict[str, Any] = dict(camp.context or {})
+
+        # payload por target tem prioridade
+        if t.payload:
+            ctx.update(t.payload)
+
+        if t.client_id:
+            c = db.query(Client).filter(Client.id == t.client_id, Client.company_id == company_id).first()
+            if not c:
+                continue
+            to_email = getattr(c, "email", None)
+            to_name = getattr(c, "nome", None) or getattr(c, "name", None)
+
+            # também joga alguns campos do cliente no ctx (útil no template)
+            if getattr(c, "nome", None) is not None:
+                ctx.setdefault("nome", c.nome)
+            if getattr(c, "email", None) is not None:
+                ctx.setdefault("email", c.email)
+        else:
+            to_email = t.email
+            to_name = None
+
+        if not to_email:
+            continue
+
+        subject_tpl = getattr(tpl, "assunto", None) or getattr(tpl, "subject", None) or ""
+        body_tpl = getattr(tpl, "html", None) or getattr(tpl, "body_html", None) or getattr(tpl, "body", None) or ""
+
+        subject_rendered = _render_placeholders(subject_tpl, ctx)
+        body_rendered = _render_placeholders(body_tpl, ctx)
+
+        log = EmailLog(
+            id=None,  # uuid default no model? se não tiver, o model deve setar default; senão remove isso
+            company_id=company_id,
+            client_id=t.client_id,
+            template_id=camp.template_id,
+            status="QUEUED",
+            to_email=to_email,
+            to_name=to_name,
+            subject_rendered=subject_rendered,
+            body_rendered=body_rendered,
+            attempt_count=0,
+            created_at=datetime.now(timezone.utc),
+            campaign_id=camp.id,
+            campaign_run_id=run.id,
+        )
+        db.add(log)
+        db.flush()  # garante log.id antes de mandar pro celery
+        created_logs += 1
+
+        # enfileira
+        send_email_job.delay(str(log.id))
+
+    db.commit()
+
+    # salva totals iniciais
+    run.totals = {"total": created_logs, "sent": 0, "failed": 0, "pending": created_logs, "by_status": {"QUEUED": created_logs}}
+    db.commit()
+    db.refresh(run)
+
+    return run
+
+
+@router.get("/{campaign_id}/runs", response_model=List[CampaignRunOut])
+def list_campaign_runs(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
+
+    runs = (
+        db.query(CampaignRun)
+        .filter(CampaignRun.campaign_id == camp.id)
+        .order_by(CampaignRun.started_at.desc())
+        .all()
+    )
+    return runs
+
+
+@router.get("/runs/{run_id}", response_model=CampaignRunOut)
+def get_run(company_id: str, run_id: str, db: Session = Depends(get_db)):
+    run = (
+        db.query(CampaignRun)
+        .join(Campaign, Campaign.id == CampaignRun.campaign_id)
+        .filter(Campaign.company_id == company_id)
+        .filter(CampaignRun.id == run_id)
+        .first()
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
     return run

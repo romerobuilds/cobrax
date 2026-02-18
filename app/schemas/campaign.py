@@ -1,19 +1,16 @@
-from typing import Any, Dict, List, Optional, Literal
+# app/schemas/campaign.py
+from __future__ import annotations
+
 from datetime import datetime
-from pydantic import BaseModel, Field, EmailStr
-from uuid import UUID
+from typing import Any, Dict, List, Optional
 
-
-CampaignStatus = Literal["draft", "scheduled", "running", "done", "cancelled"]
-CampaignMode = Literal["selected", "all", "upload"]
-
-RunStatus = Literal["running", "finished", "failed", "cancelled"]
+from pydantic import BaseModel, Field
 
 
 class CampaignCreate(BaseModel):
-    name: str = Field(..., min_length=1)
-    template_id: UUID
-    mode: CampaignMode = "selected"
+    name: str
+    template_id: str
+    mode: str = Field(default="selected")  # selected | all | upload
     context: Dict[str, Any] = Field(default_factory=dict)
     rate_per_min: int = 15
     scheduled_at: Optional[datetime] = None
@@ -21,19 +18,19 @@ class CampaignCreate(BaseModel):
 
 class CampaignUpdate(BaseModel):
     name: Optional[str] = None
-    template_id: Optional[UUID] = None
-    status: Optional[CampaignStatus] = None
-    mode: Optional[CampaignMode] = None
+    template_id: Optional[str] = None
+    status: Optional[str] = None  # draft | ready | running | done | ...
+    mode: Optional[str] = None
     context: Optional[Dict[str, Any]] = None
     rate_per_min: Optional[int] = None
     scheduled_at: Optional[datetime] = None
 
 
 class CampaignOut(BaseModel):
-    id: UUID
-    company_id: UUID
+    id: str
+    company_id: str
     name: str
-    template_id: UUID
+    template_id: str
     status: str
     mode: str
     context: Dict[str, Any]
@@ -45,38 +42,23 @@ class CampaignOut(BaseModel):
         from_attributes = True
 
 
-class CampaignTargetIn(BaseModel):
-    client_id: Optional[UUID] = None
-    email: Optional[EmailStr] = None
+class CampaignTargetAddSelected(BaseModel):
+    client_ids: List[str] = Field(default_factory=list)
     payload: Dict[str, Any] = Field(default_factory=dict)
 
 
-class CampaignTargetsAdd(BaseModel):
-    # pode mandar qualquer combinação abaixo
-    client_ids: Optional[List[UUID]] = None
-    emails: Optional[List[EmailStr]] = None
-    targets: Optional[List[CampaignTargetIn]] = None
-
-
-class CampaignTargetsAddResult(BaseModel):
-    added: int
-    skipped: int
-    total_now: int
+class CampaignTargetAddEmails(BaseModel):
+    emails: List[str] = Field(default_factory=list)
+    payload: Dict[str, Any] = Field(default_factory=dict)
 
 
 class CampaignRunOut(BaseModel):
-    id: UUID
-    campaign_id: UUID
+    id: str
+    campaign_id: str
     status: str
     started_at: datetime
     finished_at: Optional[datetime] = None
-    totals: Dict[str, Any]
+    totals: Dict[str, Any] = Field(default_factory=dict)
 
     class Config:
         from_attributes = True
-
-
-class CampaignDetailOut(BaseModel):
-    campaign: CampaignOut
-    targets_count: int
-    last_run: Optional[CampaignRunOut] = None

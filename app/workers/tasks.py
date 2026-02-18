@@ -1,8 +1,6 @@
 # app/workers/tasks.py
 from __future__ import annotations
-
 from datetime import datetime, timezone, timedelta
-
 from app.workers.celery_app import celery_app
 from app.database_.database import SessionLocal
 from app.models.email_log import EmailLog
@@ -10,6 +8,12 @@ from app.models.company import Company
 from app.models.plan import Plan
 from app.services.mailer import send_smtp_email
 from app.workers.rate_limiter import throttle_company
+from sqlalchemy import func
+from app.models.campaign import Campaign
+from app.models.campaign_run import CampaignRun
+from app.models.campaign_target import CampaignTarget
+from app.models.client import Client
+from app.models.email_template import EmailTemplate
 
 
 def _same_utc_day(dt) -> bool:
@@ -31,6 +35,61 @@ def _seconds_until_next_utc_0005(now_utc: datetime) -> int:
     next_run = datetime.combine(next_day_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(minutes=5)
     seconds = int((next_run - now_utc).total_seconds())
     return max(60, seconds)
+
+def _render_placeholders(text: str, ctx: dict) -> str:
+    """
+    Render simples: troca {{chave}} por valor.
+    (Se você já tiver jinja2/template engine em outro lugar do projeto, a gente troca depois.)
+    """
+    if not text:
+        return ""
+    out = text
+    for k, v in (ctx or {}).items():
+        out = out.replace("{{" + str(k) + "}}", str(v))
+    return out
+
+
+def _recompute_run_totals(db, run_id: str):
+    # conta por status dentro do run
+    rows = (
+        db.query(EmailLog.status, func.count(EmailLog.id))
+        .filter(EmailLog.campaign_run_id == run_id)
+        .group_by(EmailLog.status)
+        .all()
+    )
+
+    by_status = {s: int(c) for s, c in rows}
+    sent = by_status.get("SENT", 0)
+    failed = by_status.get("FAILED", 0)
+
+    pending_like = 0
+    for k in ["PENDING", "QUEUED", "SCHEDULED", "SENDING", "RETRYING", "DEFERRED"]:
+        pending_like += by_status.get(k, 0)
+
+    total = sent + failed + pending_like
+
+    run = db.query(CampaignRun).filter(CampaignRun.id == run_id).first()
+    if not run:
+        return
+
+    run.totals = {
+        "total": total,
+        "sent": sent,
+        "failed": failed,
+        "pending": pending_like,
+        "by_status": by_status,
+    }
+
+    # finaliza automaticamente quando não tiver pendentes
+    if run.status == "running" and pending_like == 0:
+        run.status = "finished"
+        run.finished_at = datetime.now(timezone.utc)
+
+        camp = db.query(Campaign).filter(Campaign.id == run.campaign_id).first()
+        if camp:
+            camp.status = "done"
+
+    db.commit()
 
 
 @celery_app.task(
@@ -118,6 +177,14 @@ def send_email_job(self, log_id: str):
 
         rate_per_min = int(rate_per_min)
 
+                # ✅ campaign override de rate_per_min (se existir)
+        if getattr(log, "campaign_id", None):
+            from app.models.campaign import Campaign
+            camp = db.query(Campaign).filter(Campaign.id == log.campaign_id).first()
+            if camp and getattr(camp, "rate_per_min", None):
+                rate_per_min = int(camp.rate_per_min)
+
+
         ok = throttle_company(str(company.id), rate_per_min, spin_seconds=8.0)
         if not ok:
             # não liberou dentro do spin -> reenqueue rápido
@@ -165,6 +232,12 @@ def send_email_job(self, log_id: str):
         log.sent_at = now
         log.error_message = None
         db.commit()
+        
+        # ✅ atualiza métricas da campanha
+        if getattr(log, "campaign_run_id", None):
+            from app.workers.tasks import _recompute_run_totals
+            _recompute_run_totals(db, str(log.campaign_run_id))
+
 
     except Exception as e:
         # ⚠️ Se estiver cancelado, não marca nada

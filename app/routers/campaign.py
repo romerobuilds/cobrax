@@ -342,3 +342,39 @@ def get_run(company_id: str, run_id: str, db: Session = Depends(get_db)):
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
     return run
+
+@router.post("/{campaign_id}/pause")
+def pause_campaign(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
+
+    if camp.status != "running":
+        raise HTTPException(status_code=400, detail="Campanha não está rodando")
+
+    camp.status = "paused"
+    db.commit()
+
+    return {"ok": True, "status": "paused"}
+
+@router.post("/{campaign_id}/cancel")
+def cancel_campaign(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
+
+    # cancela campanha
+    camp.status = "cancelled"
+
+    # cancela logs ainda não enviados
+    db.query(EmailLog).filter(
+        EmailLog.campaign_id == camp.id,
+        EmailLog.status.in_(["QUEUED", "PENDING", "RETRYING", "SENDING", "DEFERRED"])
+    ).update(
+        {
+            "status": "CANCELLED",
+            "cancelled_at": datetime.now(timezone.utc),
+            "cancelled_reason": "Campaign cancelled"
+        },
+        synchronize_session=False
+    )
+
+    db.commit()
+
+    return {"ok": True, "status": "cancelled"}

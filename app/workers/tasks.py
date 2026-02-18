@@ -124,6 +124,15 @@ def send_email_job(self, log_id: str):
             db.commit()
             return
 
+        # ✅ verifica campanha pausada (ANTES)
+        if getattr(log, "campaign_id", None):
+            camp = db.query(Campaign).filter(Campaign.id == log.campaign_id).first()
+            if camp and camp.status == "paused":
+                log.status = "PENDING"
+                log.error_message = "Campaign paused"
+                db.commit()
+                return
+
         # ✅ carrega plano (se houver)
         plan: Plan | None = None
         if getattr(company, "plan_id", None):
@@ -209,6 +218,15 @@ def send_email_job(self, log_id: str):
 
         if getattr(log, "cancelled_at", None) is not None or log.status == "CANCELLED":
             return
+
+        # ✅ RECHECA campanha pausada (DEPOIS) — evita “escapar” 1 e-mail
+        if getattr(log, "campaign_id", None):
+            camp = db.query(Campaign).filter(Campaign.id == log.campaign_id).first()
+            if camp and camp.status == "paused":
+                log.status = "PENDING"
+                log.error_message = "Campaign paused"
+                db.commit()
+                return
 
         if getattr(company, "smtp_paused", False):
             log.status = "PENDING"

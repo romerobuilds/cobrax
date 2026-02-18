@@ -280,3 +280,4 @@ def send_email_job(self, log_id: str):
 
     finally:
         db.close()
+# fim

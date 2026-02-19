@@ -52,11 +52,10 @@ services:
     command: celery -A app.workers.celery_app.celery_app beat --loglevel=info
     depends_on:
       - redis
-      - postgres
-    environment:
-      - REDIS_URL=redis://redis:6379/0
-    networks:
-      - default
+      - db
+    env_file:
+      - .env
+    restart: unless-stopped
 
 volumes:
   pgdata:

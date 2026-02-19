@@ -233,7 +233,10 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
 
     if camp.status not in ("draft", "ready"):
         # deixa passar running/done? aqui a gente bloqueia pra evitar duplicar sem querer
-        raise HTTPException(status_code=400, detail=f"Campanha em status inválido para iniciar: {camp.status}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Campanha em status inválido para iniciar: {camp.status}",
+        )
 
     tpl = db.query(EmailTemplate).filter(EmailTemplate.id == camp.template_id).first()
     if not tpl:
@@ -280,13 +283,18 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
             continue
 
         subject_tpl = getattr(tpl, "assunto", None) or getattr(tpl, "subject", None) or ""
-        body_tpl = getattr(tpl, "html", None) or getattr(tpl, "body_html", None) or getattr(tpl, "body", None) or ""
+        body_tpl = (
+            getattr(tpl, "html", None)
+            or getattr(tpl, "body_html", None)
+            or getattr(tpl, "body", None)
+            or ""
+        )
 
         subject_rendered = _render_placeholders(subject_tpl, ctx)
         body_rendered = _render_placeholders(body_tpl, ctx)
 
+        # ⚠️ NÃO passe id=None (deixa o default do model gerar)
         log = EmailLog(
-            id=None,  # uuid default no model? se não tiver, o model deve setar default; senão remove isso
             company_id=company_id,
             client_id=t.client_id,
             template_id=camp.template_id,
@@ -310,7 +318,13 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
     db.commit()
 
     # salva totals iniciais
-    run.totals = {"total": created_logs, "sent": 0, "failed": 0, "pending": created_logs, "by_status": {"QUEUED": created_logs}}
+    run.totals = {
+        "total": created_logs,
+        "sent": 0,
+        "failed": 0,
+        "pending": created_logs,
+        "by_status": {"QUEUED": created_logs},
+    }
     db.commit()
     db.refresh(run)
 
@@ -343,7 +357,12 @@ def get_run(company_id: str, run_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Run not found")
     return run
 
-@router.post("/{campaign_id}/pause")
+
+# =========================
+# PAUSE / RESUME / CANCEL
+# =========================
+
+@router.post("/{campaign_id}/pause", operation_id="pause_campaign")
 def pause_campaign(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
     camp = _ensure_campaign_company(db, company_id, campaign_id)
 
@@ -353,9 +372,59 @@ def pause_campaign(company_id: str, campaign_id: str, db: Session = Depends(get_
     camp.status = "paused"
     db.commit()
 
-    return {"ok": True, "status": "paused"}
+    # 🔥 efeito imediato na UI: joga statuses "em andamento" pra PENDING
+    updated = (
+        db.query(EmailLog)
+        .filter(EmailLog.company_id == company_id)
+        .filter(EmailLog.campaign_id == camp.id)
+        .filter(EmailLog.status.in_(["QUEUED", "SCHEDULED", "SENDING", "RETRYING", "DEFERRED"]))
+        .update(
+            {
+                "status": "PENDING",
+                "error_message": "Campaign paused",
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
 
-@router.post("/{campaign_id}/cancel")
+    return {"ok": True, "status": "paused", "updated_logs": int(updated)}
+
+
+@router.post("/{campaign_id}/resume", operation_id="resume_campaign")
+def resume_campaign(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
+
+    if camp.status != "paused":
+        raise HTTPException(status_code=400, detail=f"Campanha não está pausada (status={camp.status})")
+
+    camp.status = "running"
+    db.commit()
+
+    # re-enfileira PENDING/DEFERRED/RETRYING
+    logs = (
+        db.query(EmailLog)
+        .filter(EmailLog.company_id == company_id)
+        .filter(EmailLog.campaign_id == camp.id)
+        .filter(EmailLog.status.in_(["PENDING", "DEFERRED", "RETRYING"]))
+        .order_by(EmailLog.created_at.asc())
+        .all()
+    )
+
+    enqueued = 0
+    for log in logs:
+        log.status = "QUEUED"
+        log.error_message = None
+        db.flush()
+        send_email_job.delay(str(log.id))
+        enqueued += 1
+
+    db.commit()
+
+    return {"ok": True, "status": "running", "enqueued": int(enqueued)}
+
+
+@router.post("/{campaign_id}/cancel", operation_id="cancel_campaign")
 def cancel_campaign(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
     camp = _ensure_campaign_company(db, company_id, campaign_id)
 
@@ -364,15 +433,16 @@ def cancel_campaign(company_id: str, campaign_id: str, db: Session = Depends(get
 
     # cancela logs ainda não enviados
     db.query(EmailLog).filter(
+        EmailLog.company_id == company_id,
         EmailLog.campaign_id == camp.id,
-        EmailLog.status.in_(["QUEUED", "PENDING", "RETRYING", "SENDING", "DEFERRED"])
+        EmailLog.status.in_(["QUEUED", "PENDING", "RETRYING", "SENDING", "DEFERRED"]),
     ).update(
         {
             "status": "CANCELLED",
             "cancelled_at": datetime.now(timezone.utc),
-            "cancelled_reason": "Campaign cancelled"
+            "cancelled_reason": "Campaign cancelled",
         },
-        synchronize_session=False
+        synchronize_session=False,
     )
 
     db.commit()

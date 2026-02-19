@@ -3,7 +3,7 @@ from sqlalchemy import Column, Text, DateTime, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func
 from app.database_.database import Base
-from sqlalchemy.sql import relationship
+from sqlalchemy.orm import relationship
 
 
 class CampaignRun(Base):

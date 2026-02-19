@@ -25,7 +25,7 @@ def _utc_now() -> datetime:
 
 def _as_utc(dt: datetime | None) -> datetime | None:
     """
-    Se dt for naive, assume UTC (pra não quebrar).
+    Se dt for naive, assume UTC.
     Se dt tiver tzinfo, converte pra UTC.
     """
     if dt is None:
@@ -51,7 +51,6 @@ def _start_campaign_run(db: Session, camp: Campaign) -> CampaignRun:
     - cria EmailLogs (QUEUED)
     - enfileira send_email_job para cada log
     """
-    # valida template
     tpl = db.query(EmailTemplate).filter(EmailTemplate.id == camp.template_id).first()
     if not tpl:
         raise RuntimeError("Template não encontrado para campanha agendada")
@@ -63,9 +62,8 @@ def _start_campaign_run(db: Session, camp: Campaign) -> CampaignRun:
     run = CampaignRun(campaign_id=camp.id, status="running", totals={})
     db.add(run)
 
+    # muda status da campanha
     camp.status = "running"
-    # opcional: “limpa” scheduled_at após iniciar
-    # camp.scheduled_at = None
 
     db.flush()  # garante run.id
 
@@ -132,7 +130,6 @@ def _start_campaign_run(db: Session, camp: Campaign) -> CampaignRun:
 
         send_email_job.delay(str(log.id))
 
-    # totals iniciais
     run.totals = {
         "total": created_logs,
         "sent": 0,
@@ -153,18 +150,14 @@ def run_due_campaigns(batch_size: int = 25) -> dict:
     now_utc = _utc_now()
 
     try:
-        # pega campanhas agendadas vencidas
-        # - status “scheduled” (recomendado)
-        # - também aceito “ready” se você usar isso como “pronta pra iniciar”
+        # Apenas scheduled + vencidas (<= now)
         q = (
             db.query(Campaign)
             .filter(Campaign.scheduled_at.isnot(None))
-            .filter(func.coalesce(Campaign.status, "") .in_(["scheduled", "ready"]))
+            .filter(Campaign.status == "scheduled")
+            .filter(Campaign.scheduled_at <= now_utc)
+            .order_by(Campaign.scheduled_at.asc())
         )
-
-        # ⚠️ comparação com scheduled_at: se for timezone-aware no banco, beleza
-        # se for naive, ainda funciona, pq a coluna retorna dt naive e a gente trata com _as_utc na checagem abaixo
-        q = q.order_by(Campaign.scheduled_at.asc())
 
         # lock anti-corrida
         camps = q.with_for_update(skip_locked=True).limit(batch_size).all()
@@ -175,22 +168,18 @@ def run_due_campaigns(batch_size: int = 25) -> dict:
 
         for camp in camps:
             try:
+                # dupla segurança (caso banco retorne naive por algum motivo)
                 sched_utc = _as_utc(getattr(camp, "scheduled_at", None))
-                if not sched_utc:
+                if not sched_utc or sched_utc > now_utc:
                     skipped += 1
                     continue
 
-                if sched_utc > now_utc:
-                    # ainda não venceu
-                    skipped += 1
-                    continue
-
-                # idempotência: se já está running/paused/done/cancelled, não inicia
+                # idempotência: se status já mudou, não inicia
                 if camp.status in ("running", "paused", "done", "cancelled"):
                     skipped += 1
                     continue
 
-                # idempotência 2: se já existe run "running" para essa campanha, não inicia
+                # idempotência 2: se já existe run "running", não duplica
                 exists_running = (
                     db.query(CampaignRun.id)
                     .filter(CampaignRun.campaign_id == camp.id)
@@ -203,13 +192,12 @@ def run_due_campaigns(batch_size: int = 25) -> dict:
                     skipped += 1
                     continue
 
-                # marca “scheduled” → “running”
                 _start_campaign_run(db, camp)
                 started += 1
 
             except Exception as e:
                 errors.append(f"{camp.id}: {str(e)}")
-                # se der erro, deixa a campanha em “ready” (pra você poder reprocessar depois)
+                # deixa em ready pra você ver no front e decidir o que fazer
                 try:
                     camp.status = "ready"
                     db.flush()

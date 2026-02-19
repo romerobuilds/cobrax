@@ -1,11 +1,19 @@
 # app/schemas/campaign.py
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _as_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 # =============================
@@ -20,6 +28,24 @@ class CampaignCreate(BaseModel):
     rate_per_min: int = 15
     scheduled_at: Optional[datetime] = None
 
+    @field_validator("scheduled_at", mode="before")
+    @classmethod
+    def scheduled_at_to_utc(cls, v):
+        if v is None:
+            return None
+        # pydantic pode entregar datetime pronto ou string ISO
+        if isinstance(v, str):
+            # deixa o pydantic converter primeiro (mode="before" -> ainda string)
+            return v
+        if isinstance(v, datetime):
+            return _as_utc(v)
+        return v
+
+    @field_validator("scheduled_at", mode="after")
+    @classmethod
+    def scheduled_at_to_utc_after(cls, v):
+        return _as_utc(v)
+
 
 # =============================
 # UPDATE
@@ -28,11 +54,27 @@ class CampaignCreate(BaseModel):
 class CampaignUpdate(BaseModel):
     name: Optional[str] = None
     template_id: Optional[UUID] = None
-    status: Optional[str] = None  # draft | ready | running | done | ...
+    status: Optional[str] = None  # draft | scheduled | ready | running | done | ...
     mode: Optional[str] = None
     context: Optional[Dict[str, Any]] = None
     rate_per_min: Optional[int] = None
     scheduled_at: Optional[datetime] = None
+
+    @field_validator("scheduled_at", mode="before")
+    @classmethod
+    def scheduled_at_to_utc(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return v
+        if isinstance(v, datetime):
+            return _as_utc(v)
+        return v
+
+    @field_validator("scheduled_at", mode="after")
+    @classmethod
+    def scheduled_at_to_utc_after(cls, v):
+        return _as_utc(v)
 
 
 # =============================
@@ -52,7 +94,7 @@ class CampaignOut(BaseModel):
     created_at: datetime
 
     class Config:
-        from_attributes = True  # Pydantic v2 (equivalente ao orm_mode=True)
+        from_attributes = True  # Pydantic v2
 
 
 # =============================

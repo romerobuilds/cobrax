@@ -105,11 +105,14 @@ def create_campaign(company_id: str, body: CampaignCreate, db: Session = Depends
     if not tpl:
         raise HTTPException(status_code=400, detail="template_id inválido")
 
+    # se veio agendada, nasce scheduled
+    initial_status = "scheduled" if body.scheduled_at is not None else "draft"
+
     camp = Campaign(
         company_id=company_id,
         name=body.name,
         template_id=body.template_id,
-        status="draft",
+        status=initial_status,
         mode=body.mode or "selected",
         context=body.context or {},
         rate_per_min=int(body.rate_per_min or 15),
@@ -132,13 +135,34 @@ def update_campaign(company_id: str, campaign_id: str, body: CampaignUpdate, db:
 
     data = body.model_dump(exclude_unset=True)
 
+    # ✅ bloqueios por estado
+    immutable_when_running = {"running", "paused", "done", "cancelled"}
+    if camp.status in immutable_when_running and "scheduled_at" in data:
+        raise HTTPException(status_code=400, detail=f"Não pode alterar scheduled_at com status={camp.status}")
+
+    # ✅ valida template
     if "template_id" in data:
         tpl = db.query(EmailTemplate).filter(EmailTemplate.id == data["template_id"]).first()
         if not tpl:
             raise HTTPException(status_code=400, detail="template_id inválido")
 
+    scheduled_changed = "scheduled_at" in data
+    new_scheduled_at = data.get("scheduled_at", None)
+
+    # aplica campos
     for k, v in data.items():
         setattr(camp, k, v)
+
+    # ✅ regra automática de status baseada no scheduled_at
+    if scheduled_changed:
+        if new_scheduled_at is not None:
+            # se tava draft/ready, vira scheduled
+            if camp.status in ("draft", "ready"):
+                camp.status = "scheduled"
+        else:
+            # removeu agendamento: se estava scheduled, volta pra draft
+            if camp.status == "scheduled":
+                camp.status = "draft"
 
     db.commit()
     db.refresh(camp)
@@ -267,7 +291,8 @@ def add_targets_emails(
 def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
     camp = _ensure_campaign_company(db, company_id, campaign_id)
 
-    if camp.status not in ("draft", "ready"):
+    # ✅ permite start manual também se estiver scheduled
+    if camp.status not in ("draft", "ready", "scheduled"):
         raise HTTPException(
             status_code=400,
             detail=f"Campanha em status inválido para iniciar: {camp.status}",

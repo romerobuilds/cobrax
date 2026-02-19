@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
 from sqlalchemy import func
+from sqlalchemy.orm import Session
 
 from app.database_.database import SessionLocal
 from app.schemas.campaign import (
@@ -59,7 +59,36 @@ def _ensure_campaign_company(db: Session, company_id: str, campaign_id: str) -> 
     return camp
 
 
-@router.get("/", response_model=List[CampaignOut])
+def _calc_by_status_for_query(db: Session, q) -> Dict[str, int]:
+    rows = q.group_by(EmailLog.status).all()
+    return {str(status): int(count) for status, count in rows}
+
+
+def _normalize_stats(by_status: Dict[str, int]) -> Dict[str, Any]:
+    total = int(sum(by_status.values()))
+    sent = int(by_status.get("SENT", 0))
+    failed = int(by_status.get("FAILED", 0))
+    cancelled = int(by_status.get("CANCELLED", 0))
+
+    pending_like = 0
+    for k in ["PENDING", "QUEUED", "SCHEDULED", "SENDING", "RETRYING", "DEFERRED"]:
+        pending_like += int(by_status.get(k, 0))
+
+    return {
+        "total": total,
+        "sent": sent,
+        "failed": failed,
+        "cancelled": cancelled,
+        "pending": int(pending_like),
+        "by_status": by_status,
+    }
+
+
+# =========================
+# CRUD
+# =========================
+
+@router.get("/", response_model=List[CampaignOut], operation_id="campaigns_list")
 def list_campaigns(company_id: str, db: Session = Depends(get_db)):
     items = (
         db.query(Campaign)
@@ -70,9 +99,8 @@ def list_campaigns(company_id: str, db: Session = Depends(get_db)):
     return items
 
 
-@router.post("/", response_model=CampaignOut)
+@router.post("/", response_model=CampaignOut, operation_id="campaigns_create")
 def create_campaign(company_id: str, body: CampaignCreate, db: Session = Depends(get_db)):
-    # valida template
     tpl = db.query(EmailTemplate).filter(EmailTemplate.id == body.template_id).first()
     if not tpl:
         raise HTTPException(status_code=400, detail="template_id inválido")
@@ -93,16 +121,17 @@ def create_campaign(company_id: str, body: CampaignCreate, db: Session = Depends
     return camp
 
 
-@router.get("/{campaign_id}", response_model=CampaignOut)
+@router.get("/{campaign_id}", response_model=CampaignOut, operation_id="campaigns_get")
 def get_campaign(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
     return _ensure_campaign_company(db, company_id, campaign_id)
 
 
-@router.patch("/{campaign_id}", response_model=CampaignOut)
+@router.patch("/{campaign_id}", response_model=CampaignOut, operation_id="campaigns_update")
 def update_campaign(company_id: str, campaign_id: str, body: CampaignUpdate, db: Session = Depends(get_db)):
     camp = _ensure_campaign_company(db, company_id, campaign_id)
 
     data = body.model_dump(exclude_unset=True)
+
     if "template_id" in data:
         tpl = db.query(EmailTemplate).filter(EmailTemplate.id == data["template_id"]).first()
         if not tpl:
@@ -116,7 +145,7 @@ def update_campaign(company_id: str, campaign_id: str, body: CampaignUpdate, db:
     return camp
 
 
-@router.delete("/{campaign_id}")
+@router.delete("/{campaign_id}", operation_id="campaigns_delete")
 def delete_campaign(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
     camp = _ensure_campaign_company(db, company_id, campaign_id)
     db.delete(camp)
@@ -124,7 +153,11 @@ def delete_campaign(company_id: str, campaign_id: str, db: Session = Depends(get
     return {"ok": True}
 
 
-@router.post("/{campaign_id}/targets/selected")
+# =========================
+# TARGETS
+# =========================
+
+@router.post("/{campaign_id}/targets/selected", operation_id="campaigns_targets_selected_add")
 def add_targets_selected(
     company_id: str,
     campaign_id: str,
@@ -135,7 +168,6 @@ def add_targets_selected(
 
     added = 0
     for cid in body.client_ids or []:
-        # valida client
         c = db.query(Client).filter(Client.id == cid, Client.company_id == company_id).first()
         if not c:
             continue
@@ -158,10 +190,10 @@ def add_targets_selected(
         added += 1
 
     db.commit()
-    return {"ok": True, "added": added}
+    return {"ok": True, "added": int(added)}
 
 
-@router.post("/{campaign_id}/targets/all")
+@router.post("/{campaign_id}/targets/all", operation_id="campaigns_targets_all_add")
 def add_targets_all(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
     camp = _ensure_campaign_company(db, company_id, campaign_id)
 
@@ -187,10 +219,10 @@ def add_targets_all(company_id: str, campaign_id: str, db: Session = Depends(get
         added += 1
 
     db.commit()
-    return {"ok": True, "added": added}
+    return {"ok": True, "added": int(added)}
 
 
-@router.post("/{campaign_id}/targets/emails")
+@router.post("/{campaign_id}/targets/emails", operation_id="campaigns_targets_emails_add")
 def add_targets_emails(
     company_id: str,
     campaign_id: str,
@@ -224,15 +256,18 @@ def add_targets_emails(
         added += 1
 
     db.commit()
-    return {"ok": True, "added": added}
+    return {"ok": True, "added": int(added)}
 
 
-@router.post("/{campaign_id}/run", response_model=CampaignRunOut)
+# =========================
+# RUN
+# =========================
+
+@router.post("/{campaign_id}/run", response_model=CampaignRunOut, operation_id="campaigns_run_start")
 def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
     camp = _ensure_campaign_company(db, company_id, campaign_id)
 
     if camp.status not in ("draft", "ready"):
-        # deixa passar running/done? aqui a gente bloqueia pra evitar duplicar sem querer
         raise HTTPException(
             status_code=400,
             detail=f"Campanha em status inválido para iniciar: {camp.status}",
@@ -253,24 +288,25 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
     db.refresh(run)
 
     created_logs = 0
+    now = datetime.now(timezone.utc)
 
     for t in targets:
-        to_email = None
-        to_name = None
         ctx: Dict[str, Any] = dict(camp.context or {})
 
-        # payload por target tem prioridade
         if t.payload:
             ctx.update(t.payload)
+
+        to_email = None
+        to_name = None
 
         if t.client_id:
             c = db.query(Client).filter(Client.id == t.client_id, Client.company_id == company_id).first()
             if not c:
                 continue
+
             to_email = getattr(c, "email", None)
             to_name = getattr(c, "nome", None) or getattr(c, "name", None)
 
-            # também joga alguns campos do cliente no ctx (útil no template)
             if getattr(c, "nome", None) is not None:
                 ctx.setdefault("nome", c.nome)
             if getattr(c, "email", None) is not None:
@@ -293,7 +329,6 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
         subject_rendered = _render_placeholders(subject_tpl, ctx)
         body_rendered = _render_placeholders(body_tpl, ctx)
 
-        # ⚠️ NÃO passe id=None (deixa o default do model gerar)
         log = EmailLog(
             company_id=company_id,
             client_id=t.client_id,
@@ -304,26 +339,24 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
             subject_rendered=subject_rendered,
             body_rendered=body_rendered,
             attempt_count=0,
-            created_at=datetime.now(timezone.utc),
+            created_at=now,
             campaign_id=camp.id,
             campaign_run_id=run.id,
         )
-        db.add(log)
-        db.flush()  # garante log.id antes de mandar pro celery
-        created_logs += 1
 
-        # enfileira
+        db.add(log)
+        db.flush()
+        created_logs += 1
         send_email_job.delay(str(log.id))
 
     db.commit()
 
-    # salva totals iniciais
     run.totals = {
-        "total": created_logs,
+        "total": int(created_logs),
         "sent": 0,
         "failed": 0,
-        "pending": created_logs,
-        "by_status": {"QUEUED": created_logs},
+        "pending": int(created_logs),
+        "by_status": {"QUEUED": int(created_logs)},
     }
     db.commit()
     db.refresh(run)
@@ -331,7 +364,7 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
     return run
 
 
-@router.get("/{campaign_id}/runs", response_model=List[CampaignRunOut])
+@router.get("/{campaign_id}/runs", response_model=List[CampaignRunOut], operation_id="campaigns_runs_list")
 def list_campaign_runs(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
     camp = _ensure_campaign_company(db, company_id, campaign_id)
 
@@ -344,7 +377,7 @@ def list_campaign_runs(company_id: str, campaign_id: str, db: Session = Depends(
     return runs
 
 
-@router.get("/runs/{run_id}", response_model=CampaignRunOut)
+@router.get("/runs/{run_id}", response_model=CampaignRunOut, operation_id="campaigns_runs_get")
 def get_run(company_id: str, run_id: str, db: Session = Depends(get_db)):
     run = (
         db.query(CampaignRun)
@@ -359,10 +392,52 @@ def get_run(company_id: str, run_id: str, db: Session = Depends(get_db)):
 
 
 # =========================
+# STATS (REAL TIME)
+# =========================
+
+@router.get("/runs/{run_id}/stats", operation_id="campaigns_runs_stats")
+def get_run_stats(company_id: str, run_id: str, db: Session = Depends(get_db)):
+    run = (
+        db.query(CampaignRun)
+        .join(Campaign, Campaign.id == CampaignRun.campaign_id)
+        .filter(Campaign.company_id == company_id)
+        .filter(CampaignRun.id == run_id)
+        .first()
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    by_status = _calc_by_status_for_query(
+        db,
+        db.query(EmailLog.status, func.count(EmailLog.id)).filter(EmailLog.campaign_run_id == run.id),
+    )
+
+    out = _normalize_stats(by_status)
+    out.update({"run_id": str(run.id), "campaign_id": str(run.campaign_id), "run_status": run.status})
+    return out
+
+
+@router.get("/{campaign_id}/stats", operation_id="campaigns_stats")
+def get_campaign_stats(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
+
+    by_status = _calc_by_status_for_query(
+        db,
+        db.query(EmailLog.status, func.count(EmailLog.id))
+        .filter(EmailLog.company_id == company_id)
+        .filter(EmailLog.campaign_id == camp.id),
+    )
+
+    out = _normalize_stats(by_status)
+    out.update({"campaign_id": str(camp.id), "campaign_status": camp.status})
+    return out
+
+
+# =========================
 # PAUSE / RESUME / CANCEL
 # =========================
 
-@router.post("/{campaign_id}/pause", operation_id="pause_campaign")
+@router.post("/{campaign_id}/pause", operation_id="campaigns_pause")
 def pause_campaign(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
     camp = _ensure_campaign_company(db, company_id, campaign_id)
 
@@ -372,17 +447,13 @@ def pause_campaign(company_id: str, campaign_id: str, db: Session = Depends(get_
     camp.status = "paused"
     db.commit()
 
-    # 🔥 efeito imediato na UI: joga statuses "em andamento" pra PENDING
     updated = (
         db.query(EmailLog)
         .filter(EmailLog.company_id == company_id)
         .filter(EmailLog.campaign_id == camp.id)
         .filter(EmailLog.status.in_(["QUEUED", "SCHEDULED", "SENDING", "RETRYING", "DEFERRED"]))
         .update(
-            {
-                "status": "PENDING",
-                "error_message": "Campaign paused",
-            },
+            {"status": "PENDING", "error_message": "Campaign paused"},
             synchronize_session=False,
         )
     )
@@ -391,7 +462,7 @@ def pause_campaign(company_id: str, campaign_id: str, db: Session = Depends(get_
     return {"ok": True, "status": "paused", "updated_logs": int(updated)}
 
 
-@router.post("/{campaign_id}/resume", operation_id="resume_campaign")
+@router.post("/{campaign_id}/resume", operation_id="campaigns_resume")
 def resume_campaign(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
     camp = _ensure_campaign_company(db, company_id, campaign_id)
 
@@ -401,7 +472,6 @@ def resume_campaign(company_id: str, campaign_id: str, db: Session = Depends(get
     camp.status = "running"
     db.commit()
 
-    # re-enfileira PENDING/DEFERRED/RETRYING
     logs = (
         db.query(EmailLog)
         .filter(EmailLog.company_id == company_id)
@@ -420,31 +490,29 @@ def resume_campaign(company_id: str, campaign_id: str, db: Session = Depends(get
         enqueued += 1
 
     db.commit()
-
     return {"ok": True, "status": "running", "enqueued": int(enqueued)}
 
 
-@router.post("/{campaign_id}/cancel", operation_id="cancel_campaign")
+@router.post("/{campaign_id}/cancel", operation_id="campaigns_cancel")
 def cancel_campaign(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
     camp = _ensure_campaign_company(db, company_id, campaign_id)
 
-    # cancela campanha
     camp.status = "cancelled"
 
-    # cancela logs ainda não enviados
-    db.query(EmailLog).filter(
-        EmailLog.company_id == company_id,
-        EmailLog.campaign_id == camp.id,
-        EmailLog.status.in_(["QUEUED", "PENDING", "RETRYING", "SENDING", "DEFERRED"]),
-    ).update(
-        {
-            "status": "CANCELLED",
-            "cancelled_at": datetime.now(timezone.utc),
-            "cancelled_reason": "Campaign cancelled",
-        },
-        synchronize_session=False,
+    updated = (
+        db.query(EmailLog)
+        .filter(EmailLog.company_id == company_id)
+        .filter(EmailLog.campaign_id == camp.id)
+        .filter(EmailLog.status.in_(["QUEUED", "PENDING", "RETRYING", "SENDING", "DEFERRED"]))
+        .update(
+            {
+                "status": "CANCELLED",
+                "cancelled_at": datetime.now(timezone.utc),
+                "cancelled_reason": "Campaign cancelled",
+            },
+            synchronize_session=False,
+        )
     )
 
     db.commit()
-
-    return {"ok": True, "status": "cancelled"}
+    return {"ok": True, "status": "cancelled", "updated_logs": int(updated)}

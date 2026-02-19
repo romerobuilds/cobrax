@@ -1,0 +1,10 @@
+UPDATE companies
+SET
+  smtp_host = 'smtp.gmail.com',
+  smtp_port = 587,
+  smtp_user = 'romerohigor97@gmail.com',
+  smtp_password = 'tjbswcuqfgevxjnb',
+  smtp_use_tls = true,
+  from_email = 'romerohigor97@gmail.com',
+  from_name = 'OmniSmart'
+WHERE id = 'a249a80a-b2c7-4310-9fbe-f150ca9a1c6a';

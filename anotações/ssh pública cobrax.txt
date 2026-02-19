@@ -1,0 +1,2 @@
+ssh pública cobrax
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA940tpw+kVcE35tHivuYyIK/KFe0S//zIFlJZhO8T6v cobrax@dev

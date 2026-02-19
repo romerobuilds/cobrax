@@ -1,0 +1,25 @@
+Depois que você criar ou editar arquivos no VS Code, no Git Bash faça:
+
+git add . && git commit -m "..." && git push
+
+Depois no servidor ssh cobrax@95.216.138.163:
+
+cd ~/apps/cobrax
+git pull
+docker compose up -d --build
+docker logs cobrax_worker --tail 100
+
+Forçar:
+
+cd ~/apps/cobrax
+git status
+git log -1 --oneline
+
+git fetch origin
+git reset --hard origin/main
+
+
+Rebuildar Docker:
+
+docker compose down
+docker compose up -d --build

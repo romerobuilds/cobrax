@@ -1,0 +1,31 @@
+entrar no servidor:
+ssh cobrax@95.216.138.163
+
+--------------------------------------------------------------------------------
+
+2) Rebuild e subir
+docker compose down
+docker compose build --no-cache api worker
+docker compose up -d
+
+3) Checar logs
+docker compose logs -f api
+
+--------------------------------------------------------------------------------
+Entrar no Banco de dados (postgre)
+docker exec -it cobrax_postgres psql -U cobrax -d cobrax
+
+--------------------------------------------------------------------------------
+Rodar servidor
+
+npm run dev -- --host
+
+# rebuild do front
+npm run build
+
+--------------------------------------------------------------------------------
+# derruba o container web
+docker compose -f docker-compose.web.yml down
+
+# sobe de novo
+docker compose -f docker-compose.web.yml up -d --force-recreate

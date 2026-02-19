@@ -1,0 +1,5 @@
+POSTGRE SQL DADOS
+
+USER: cobrax
+PASSWORD: An@ly2904
+DB: cobrax

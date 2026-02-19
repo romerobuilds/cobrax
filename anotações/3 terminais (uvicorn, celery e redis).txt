@@ -1,0 +1,14 @@
+uvicorn app.main:app --reload
+
+docker run -p 6379:6379 redis
+
+celery -A app.workers.celery_app.celery_app worker --loglevel=INFO --pool=solo
+
+--------------------------------------------------------------------------------
+
+celery -A app.workers.celery_app.celery_app worker -l info -P solo
+
+--------------------------------------------------------------------------------
+.env caso for rodar local
+DATABASE_URL=postgresql+psycopg2://cobrax:An%40ly2904@127.0.0.1:5432/cobrax
+

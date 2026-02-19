@@ -1,0 +1,75 @@
+🧑 Cliente (vindas do banco via client_id)
+
+Essas NÃO precisam ir no context, o sistema resolve sozinho:
+
+{{nome_cliente}} → Nome do cliente
+
+{{email_cliente}} → Email do cliente
+
+{{telefone_cliente}} → Telefone do cliente (se existir)
+
+🏢 Empresa (vindas do banco via company_id)
+
+Também automáticas:
+
+{{nome_empresa}} → Nome da empresa
+
+{{email_empresa}} → Email da empresa (from_email)
+
+🧩 Variáveis dinâmicas (vindas do context)
+
+Essas VOCÊ define no JSON:
+
+{{valor}} → Valor devido
+
+{{vencimento}} → Data de vencimento
+
+{{contrato}} → Nome do plano / contrato
+
+{{descricao}} → Descrição livre
+
+{{numero_fatura}} → Número da cobrança
+
+{{link_pagamento}} → Link de pagamento
+
+{{observacao}} → Observação extra
+
+💡 Regra de ouro:
+se não estiver no context → vira None no email
+
+JSON COMPLETO de exemplo:
+
+{
+  "client_id": "504dfc33-9854-4ded-950e-3eb792307e8b",
+  "context": {
+    "valor": "R$ 200,00",
+    "vencimento": "15/02/2026",
+    "contrato": "Plano OmniSmart Gold",
+    "descricao": "Mensalidade referente a Janeiro/2026",
+    "numero_fatura": "FT-2026-0001",
+    "link_pagamento": "https://pagamentos.omnismart.com.br/fatura/FT-2026-0001",
+    "observacao": "Evite juros realizando o pagamento até o vencimento."
+  }
+}
+
+Exemplo de template usando TODAS:
+
+
+Olá {{nome_cliente}},
+
+Identificamos um débito referente ao {{contrato}}.
+
+🧾 Fatura: {{numero_fatura}}
+💰 Valor: {{valor}}
+📅 Vencimento: {{vencimento}}
+
+📌 Descrição:
+{{descricao}}
+
+💳 Pague aqui:
+{{link_pagamento}}
+
+Obs: {{observacao}}
+
+Atenciosamente,
+{{nome_empresa}}

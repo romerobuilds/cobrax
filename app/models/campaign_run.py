@@ -3,6 +3,7 @@ from sqlalchemy import Column, Text, DateTime, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func
 from app.database_.database import Base
+from sqlalchemy.sql import relationship
 
 
 class CampaignRun(Base):
@@ -21,3 +22,5 @@ class CampaignRun(Base):
     finished_at = Column(DateTime(timezone=True), nullable=True)
 
     totals = Column(JSONB, nullable=False, default=dict)
+
+    email_logs = relationship("EmailLog", back_populates="campaign_run", cascade="all, delete-orphan")

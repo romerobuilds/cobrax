@@ -3,7 +3,7 @@ from sqlalchemy import Column, String, Text, Integer, ForeignKey, DateTime
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func
 from app.database_.database import Base
-
+from sqlalchemy.sql import relationship
 
 class Campaign(Base):
     __tablename__ = "campaigns"
@@ -22,3 +22,5 @@ class Campaign(Base):
 
     scheduled_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    email_logs = relationship("EmailLog", back_populates="campaign", cascade="all, delete-orphan")

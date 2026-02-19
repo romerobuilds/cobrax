@@ -3,7 +3,7 @@ import uuid
 from sqlalchemy import Column, String, Text, Integer, ForeignKey, DateTime
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
-
+from sqlalchemy.orm import relationship
 from app.database_.database import Base
 
 
@@ -12,6 +12,7 @@ class EmailLog(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     company_id = Column(UUID(as_uuid=True), ForeignKey("companies.id"), nullable=False)
+    company = relationship("Company", back_populates="email_logs")
     client_id = Column(UUID(as_uuid=True), ForeignKey("clients.id"), nullable=True)
     template_id = Column(UUID(as_uuid=True), ForeignKey("email_templates.id"), nullable=True)
 

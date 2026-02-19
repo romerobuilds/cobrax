@@ -24,5 +24,11 @@ celery_app.conf.beat_schedule = {
         "task": "app.workers.scheduler.check_scheduled_campaigns",
         "schedule": 60.0,
     },
+    "run-due-campaigns-every-30s": {
+        "task": "campaigns.run_due_campaigns",
+        "schedule": 30.0,  # a cada 30s
+    },    
 }
+
+
 

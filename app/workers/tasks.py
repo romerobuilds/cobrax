@@ -280,4 +280,16 @@ def send_email_job(self, log_id: str):
 
     finally:
         db.close()
-# fim
+
+
+# =========================
+# SCHEDULER (Celery Beat)
+# =========================
+# Beat vai chamar essa task (via celery_app.conf.beat_schedule)
+
+from app.workers.scheduler import run_due_campaigns
+
+
+@celery_app.task(name="campaigns.run_due_campaigns")
+def run_due_campaigns_job():
+    return run_due_campaigns(batch_size=25)

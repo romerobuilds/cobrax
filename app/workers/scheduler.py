@@ -1,8 +1,7 @@
-# app/workers/scheduler.py
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -49,6 +48,7 @@ def _start_campaign_run(db: Session, camp: Campaign) -> CampaignRun:
     Inicia uma campanha:
     - cria CampaignRun
     - cria EmailLogs (QUEUED)
+    - COMMIT
     - enfileira send_email_job para cada log
     """
     tpl = db.query(EmailTemplate).filter(EmailTemplate.id == camp.template_id).first()
@@ -68,14 +68,16 @@ def _start_campaign_run(db: Session, camp: Campaign) -> CampaignRun:
     db.flush()  # garante run.id
 
     created_logs = 0
+    now = _utc_now()
+    queued_log_ids: List[str] = []
 
     for t in targets:
         ctx: Dict[str, Any] = dict(camp.context or {})
         if t.payload:
             ctx.update(t.payload)
 
-        to_email = None
-        to_name = None
+        to_email: Optional[str] = None
+        to_name: Optional[str] = None
 
         if t.client_id:
             c = (
@@ -120,23 +122,31 @@ def _start_campaign_run(db: Session, camp: Campaign) -> CampaignRun:
             subject_rendered=subject_rendered,
             body_rendered=body_rendered,
             attempt_count=0,
-            created_at=_utc_now(),
+            created_at=now,
             campaign_id=camp.id,
             campaign_run_id=run.id,
         )
         db.add(log)
         db.flush()  # garante log.id
+        queued_log_ids.append(str(log.id))
         created_logs += 1
 
-        send_email_job.delay(str(log.id))
-
     run.totals = {
-        "total": created_logs,
+        "total": int(created_logs),
         "sent": 0,
         "failed": 0,
-        "pending": created_logs,
-        "by_status": {"QUEUED": created_logs},
+        "cancelled": 0,
+        "pending": int(created_logs),
+        "by_status": {"QUEUED": int(created_logs)} if created_logs else {},
     }
+
+    # ✅ commit antes de enfileirar (evita corrida do worker não achar log)
+    db.commit()
+    db.refresh(run)
+
+    # ✅ enfileira após commit
+    for log_id in queued_log_ids:
+        send_email_job.delay(log_id)
 
     return run
 
@@ -150,7 +160,6 @@ def run_due_campaigns(batch_size: int = 25) -> dict:
     now_utc = _utc_now()
 
     try:
-        # Apenas scheduled + vencidas (<= now)
         q = (
             db.query(Campaign)
             .filter(Campaign.scheduled_at.isnot(None))
@@ -159,7 +168,6 @@ def run_due_campaigns(batch_size: int = 25) -> dict:
             .order_by(Campaign.scheduled_at.asc())
         )
 
-        # lock anti-corrida
         camps = q.with_for_update(skip_locked=True).limit(batch_size).all()
 
         started = 0
@@ -168,44 +176,68 @@ def run_due_campaigns(batch_size: int = 25) -> dict:
 
         for camp in camps:
             try:
-                # dupla segurança (caso banco retorne naive por algum motivo)
                 sched_utc = _as_utc(getattr(camp, "scheduled_at", None))
                 if not sched_utc or sched_utc > now_utc:
                     skipped += 1
                     continue
 
-                # idempotência: se status já mudou, não inicia
+                # se status mudou por alguma razão, pula
                 if camp.status in ("running", "paused", "done", "cancelled"):
                     skipped += 1
                     continue
 
-                # idempotência 2: se já existe run "running", não duplica
-                exists_running = (
-                    db.query(CampaignRun.id)
+                # idempotência forte:
+                # se já existe run "running" -> não duplica
+                running_run = (
+                    db.query(CampaignRun)
                     .filter(CampaignRun.campaign_id == camp.id)
                     .filter(CampaignRun.status == "running")
+                    .order_by(CampaignRun.started_at.desc())
                     .first()
                 )
-                if exists_running:
+                if running_run:
                     camp.status = "running"
-                    db.flush()
+                    db.commit()
                     skipped += 1
                     continue
+
+                # se já existe um run mais recente e já existem logs para ele,
+                # é sinal de que o start já aconteceu antes (mesmo que status esteja errado)
+                last_run = (
+                    db.query(CampaignRun)
+                    .filter(CampaignRun.campaign_id == camp.id)
+                    .order_by(CampaignRun.started_at.desc())
+                    .first()
+                )
+                if last_run:
+                    any_logs = (
+                        db.query(EmailLog.id)
+                        .filter(EmailLog.campaign_run_id == last_run.id)
+                        .first()
+                    )
+                    if any_logs:
+                        # corrige status da campanha baseado no run
+                        if last_run.status in ("running", "paused"):
+                            camp.status = last_run.status
+                        elif last_run.status in ("finished", "cancelled"):
+                            camp.status = "done" if last_run.status == "finished" else "cancelled"
+                        db.commit()
+                        skipped += 1
+                        continue
 
                 _start_campaign_run(db, camp)
                 started += 1
 
             except Exception as e:
                 errors.append(f"{camp.id}: {str(e)}")
-                # deixa em ready pra você ver no front e decidir o que fazer
+                # deixa em ready pra você enxergar no Swagger/front e decidir
                 try:
                     camp.status = "ready"
-                    db.flush()
+                    db.commit()
                 except Exception:
-                    pass
+                    db.rollback()
 
-        db.commit()
-        return {"ok": True, "started": started, "skipped": skipped, "errors": errors}
+        return {"ok": True, "started": int(started), "skipped": int(skipped), "errors": errors}
 
     except Exception as e:
         db.rollback()

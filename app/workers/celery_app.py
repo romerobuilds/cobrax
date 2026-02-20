@@ -8,7 +8,7 @@ celery_app = Celery(
     "cobrax",
     broker=REDIS_URL,
     backend=REDIS_URL,
-    include=["app.workers.tasks"],  # garante registro da task
+    include=["app.workers.tasks"],  # garante registro das tasks
 )
 
 celery_app.conf.update(
@@ -20,15 +20,9 @@ celery_app.conf.update(
 )
 
 celery_app.conf.beat_schedule = {
-    "check-scheduled-campaigns-every-minute": {
-        "task": "app.workers.scheduler.check_scheduled_campaigns",
-        "schedule": 60.0,
-    },
+    # ✅ Campanhas agendadas (scheduled_at)
     "run-due-campaigns-every-30s": {
         "task": "campaigns.run_due_campaigns",
-        "schedule": 30.0,  # a cada 30s
-    },    
+        "schedule": 30.0,
+    },
 }
-
-
-

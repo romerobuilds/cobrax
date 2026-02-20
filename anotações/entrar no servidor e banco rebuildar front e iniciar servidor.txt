@@ -29,3 +29,9 @@ docker compose -f docker-compose.web.yml down
 
 # sobe de novo
 docker compose -f docker-compose.web.yml up -d --force-recreate
+
+--------------------------------------------------------------------------------
+
+UPDATE campaigns
+SET status = 'draft'
+WHERE id = '8fa577f6-03a4-4c27-b109-73354fa26b68';

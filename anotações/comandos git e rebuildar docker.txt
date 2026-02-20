@@ -4,10 +4,9 @@ git add . && git commit -m "..." && git push
 
 Depois no servidor ssh cobrax@95.216.138.163:
 
-cd ~/apps/cobrax
-git pull
+git pull origin main
+docker compose down
 docker compose up -d --build
-docker logs cobrax_worker --tail 100
 
 Forçar:
 

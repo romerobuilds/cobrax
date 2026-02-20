@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import func
+from celery.exceptions import Retry  # ✅ importante: não tratar self.retry como "erro"
 
 from app.workers.celery_app import celery_app
 from app.database_.database import SessionLocal
@@ -13,7 +14,7 @@ from app.models.plan import Plan
 from app.services.mailer import send_smtp_email
 from app.workers.rate_limiter import throttle_company
 
-# Campanhas (usados em totals + override rate)
+# Campanhas
 from app.models.campaign import Campaign
 from app.models.campaign_run import CampaignRun
 
@@ -43,10 +44,7 @@ def _seconds_until_next_utc_0005(now_utc: datetime) -> int:
 
 
 def _render_placeholders(text: str, ctx: dict) -> str:
-    """
-    Render simples: troca {{chave}} por valor.
-    (Se você já tiver jinja2/template engine em outro lugar do projeto, a gente troca depois.)
-    """
+    """Render simples: troca {{chave}} por valor."""
     if not text:
         return ""
     out = text
@@ -56,7 +54,11 @@ def _render_placeholders(text: str, ctx: dict) -> str:
 
 
 def _recompute_run_totals(db, run_id: str):
-    # conta por status dentro do run
+    """
+    Recalcula totals do run com base em email_logs.
+    Inclui CANCELLED e calcula total como soma real dos status.
+    Finaliza run/campanha quando pending_like == 0.
+    """
     rows = (
         db.query(EmailLog.status, func.count(EmailLog.id))
         .filter(EmailLog.campaign_run_id == run_id)
@@ -64,15 +66,17 @@ def _recompute_run_totals(db, run_id: str):
         .all()
     )
 
-    by_status = {s: int(c) for s, c in rows}
-    sent = by_status.get("SENT", 0)
-    failed = by_status.get("FAILED", 0)
+    by_status = {str(s): int(c) for s, c in rows}
+
+    sent = int(by_status.get("SENT", 0))
+    failed = int(by_status.get("FAILED", 0))
+    cancelled = int(by_status.get("CANCELLED", 0))
 
     pending_like = 0
     for k in ["PENDING", "QUEUED", "SCHEDULED", "SENDING", "RETRYING", "DEFERRED"]:
-        pending_like += by_status.get(k, 0)
+        pending_like += int(by_status.get(k, 0))
 
-    total = sent + failed + pending_like
+    total = int(sum(by_status.values()))
 
     run = db.query(CampaignRun).filter(CampaignRun.id == run_id).first()
     if not run:
@@ -82,20 +86,32 @@ def _recompute_run_totals(db, run_id: str):
         "total": total,
         "sent": sent,
         "failed": failed,
-        "pending": pending_like,
+        "cancelled": cancelled,
+        "pending": int(pending_like),
         "by_status": by_status,
     }
 
-    # finaliza automaticamente quando não tiver pendentes
-    if run.status == "running" and pending_like == 0:
-        run.status = "finished"
+    # ✅ finaliza automaticamente quando não tiver pendentes
+    if run.status in ("running", "paused") and pending_like == 0:
+        # se já estiver cancelado no nível do run, respeita
+        if run.status != "cancelled":
+            run.status = "finished"
         run.finished_at = datetime.now(timezone.utc)
 
         camp = db.query(Campaign).filter(Campaign.id == run.campaign_id).first()
-        if camp:
+        if camp and camp.status not in ("cancelled",):
+            # mantém seu padrão existente
             camp.status = "done"
 
     db.commit()
+
+
+def _safe_update_totals_after_status_change(db, log: EmailLog | None):
+    """Atualiza totals se o log pertence a um run."""
+    if not log:
+        return
+    if getattr(log, "campaign_run_id", None):
+        _recompute_run_totals(db, str(log.campaign_run_id))
 
 
 @celery_app.task(
@@ -122,6 +138,7 @@ def send_email_job(self, log_id: str):
             log.status = "FAILED"
             log.error_message = "Company not found"
             db.commit()
+            _safe_update_totals_after_status_change(db, log)
             return
 
         # ✅ verifica campanha pausada (ANTES)
@@ -131,6 +148,7 @@ def send_email_job(self, log_id: str):
                 log.status = "PENDING"
                 log.error_message = "Campaign paused"
                 db.commit()
+                _safe_update_totals_after_status_change(db, log)
                 return
 
         # ✅ carrega plano (se houver)
@@ -143,6 +161,7 @@ def send_email_job(self, log_id: str):
             log.status = "PENDING"
             log.error_message = "SMTP pausado"
             db.commit()
+            _safe_update_totals_after_status_change(db, log)
             return
 
         # ✅ validações mínimas
@@ -150,6 +169,7 @@ def send_email_job(self, log_id: str):
             log.status = "FAILED"
             log.error_message = "Log sem to_email"
             db.commit()
+            _safe_update_totals_after_status_change(db, log)
             return
 
         required = [company.smtp_host, company.smtp_port, company.from_email, company.from_name]
@@ -157,6 +177,7 @@ def send_email_job(self, log_id: str):
             log.status = "FAILED"
             log.error_message = "SMTP config incompleta na company"
             db.commit()
+            _safe_update_totals_after_status_change(db, log)
             return
 
         now = datetime.now(timezone.utc)
@@ -174,13 +195,14 @@ def send_email_job(self, log_id: str):
 
         sent_today = getattr(company, "emails_sent_today", 0) or 0
 
-        # ✅ bateu limite diário? NÃO FAIL. Marca DEFERRED e reagenda pro próximo dia (UTC)
+        # ✅ bateu limite diário? NÃO FAIL. Marca DEFERRED e reagenda
         if daily_limit is not None and sent_today >= int(daily_limit):
             log.status = "DEFERRED"
             log.error_message = (
                 f"Limite diário atingido ({sent_today}/{daily_limit}) - reagendado para amanhã (UTC)"
             )
             db.commit()
+            _safe_update_totals_after_status_change(db, log)
 
             countdown = _seconds_until_next_utc_0005(now)
             raise self.retry(countdown=countdown)
@@ -191,7 +213,6 @@ def send_email_job(self, log_id: str):
             rate_per_min = getattr(plan, "rate_per_min", None)
         if rate_per_min is None:
             rate_per_min = 20
-
         rate_per_min = int(rate_per_min)
 
         # ✅ campaign override de rate_per_min (se existir)
@@ -211,6 +232,7 @@ def send_email_job(self, log_id: str):
         log.status = "SENDING"
         log.error_message = None
         db.commit()
+        _safe_update_totals_after_status_change(db, log)
 
         # ✅ checagem final (cancel/pause entre throttle e envio)
         db.refresh(log)
@@ -219,19 +241,21 @@ def send_email_job(self, log_id: str):
         if getattr(log, "cancelled_at", None) is not None or log.status == "CANCELLED":
             return
 
-        # ✅ RECHECA campanha pausada (DEPOIS) — evita “escapar” 1 e-mail
+        # ✅ RECHECA campanha pausada (DEPOIS)
         if getattr(log, "campaign_id", None):
             camp = db.query(Campaign).filter(Campaign.id == log.campaign_id).first()
             if camp and camp.status == "paused":
                 log.status = "PENDING"
                 log.error_message = "Campaign paused"
                 db.commit()
+                _safe_update_totals_after_status_change(db, log)
                 return
 
         if getattr(company, "smtp_paused", False):
             log.status = "PENDING"
             log.error_message = "SMTP pausado"
             db.commit()
+            _safe_update_totals_after_status_change(db, log)
             return
 
         # ✅ envia
@@ -256,10 +280,11 @@ def send_email_job(self, log_id: str):
         log.sent_at = now
         log.error_message = None
         db.commit()
+        _safe_update_totals_after_status_change(db, log)
 
-        # ✅ atualiza métricas da campanha
-        if getattr(log, "campaign_run_id", None):
-            _recompute_run_totals(db, str(log.campaign_run_id))
+    except Retry:
+        # ✅ self.retry() NÃO é erro: não sobrescrever status (DEFERRED etc)
+        raise
 
     except Exception as e:
         # ⚠️ Se estiver cancelado, não marca nada
@@ -273,6 +298,7 @@ def send_email_job(self, log_id: str):
                 log2.status = "RETRYING" if retries_left > 0 else "FAILED"
                 log2.error_message = str(e)
                 db.commit()
+                _safe_update_totals_after_status_change(db, log2)
         except Exception:
             pass
 
@@ -285,7 +311,6 @@ def send_email_job(self, log_id: str):
 # =========================
 # SCHEDULER (Celery Beat)
 # =========================
-# Beat vai chamar essa task (via celery_app.conf.beat_schedule)
 
 from app.workers.scheduler import run_due_campaigns
 

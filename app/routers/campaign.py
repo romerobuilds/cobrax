@@ -3,10 +3,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from io import BytesIO
+import csv
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.database_.database import SessionLocal
 from app.schemas.campaign import (
@@ -26,6 +29,11 @@ from app.models.email_template import EmailTemplate
 from app.models.email_log import EmailLog
 
 from app.workers.tasks import send_email_job
+
+try:
+    import openpyxl  # pip install openpyxl
+except Exception:
+    openpyxl = None
 
 
 router = APIRouter(prefix="/empresas/{company_id}/campanhas", tags=["Campanhas"])
@@ -127,6 +135,92 @@ def _persist_run_totals(db: Session, run: CampaignRun) -> Dict[str, Any]:
     return stats
 
 
+# -------------------------
+# Upload helpers (CSV/XLSX)
+# -------------------------
+
+def _normalize_header(h: Any) -> str:
+    return str(h or "").strip()
+
+
+def _guess_delimiter(sample: str) -> str:
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=";,")
+        return dialect.delimiter
+    except Exception:
+        return ";" if sample.count(";") > sample.count(",") else ","
+
+
+def _parse_csv_bytes(data: bytes, limit: int) -> List[Dict[str, Any]]:
+    text = data.decode("utf-8-sig", errors="replace")
+    sample = text[:2048]
+    delim = _guess_delimiter(sample)
+
+    rows: List[Dict[str, Any]] = []
+    reader = csv.DictReader(text.splitlines(), delimiter=delim)
+    for i, row in enumerate(reader, start=1):
+        if i > limit:
+            break
+        if not row:
+            continue
+        clean = {_normalize_header(k): (v if v is not None else "") for k, v in row.items()}
+        rows.append(clean)
+    return rows
+
+
+def _parse_xlsx_bytes(data: bytes, limit: int) -> List[Dict[str, Any]]:
+    if openpyxl is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Upload XLSX não disponível (dependência openpyxl não instalada). Use CSV ou instale openpyxl.",
+        )
+
+    wb = openpyxl.load_workbook(BytesIO(data), read_only=True, data_only=True)
+    ws = wb.active
+
+    it = ws.iter_rows(values_only=True)
+    try:
+        headers_raw = next(it)
+    except StopIteration:
+        return []
+
+    headers = [_normalize_header(h) for h in (headers_raw or [])]
+
+    rows: List[Dict[str, Any]] = []
+    for idx, values in enumerate(it, start=1):
+        if idx > limit:
+            break
+        if values is None:
+            continue
+
+        row_dict: Dict[str, Any] = {}
+        for col_i, val in enumerate(values):
+            if col_i >= len(headers):
+                continue
+            key = headers[col_i]
+            if not key:
+                continue
+            row_dict[key] = "" if val is None else str(val).strip()
+
+        if row_dict:
+            rows.append(row_dict)
+
+    return rows
+
+
+def _parse_upload_file(file: UploadFile, data: bytes, limit: int) -> List[Dict[str, Any]]:
+    filename = (file.filename or "").lower()
+    ctype = (file.content_type or "").lower()
+
+    if filename.endswith(".csv") or "csv" in ctype:
+        return _parse_csv_bytes(data, limit)
+
+    if filename.endswith(".xlsx") or "spreadsheet" in ctype or "excel" in ctype:
+        return _parse_xlsx_bytes(data, limit)
+
+    raise HTTPException(status_code=400, detail="Formato inválido. Envie CSV ou XLSX.")
+
+
 # =========================
 # CRUD
 # =========================
@@ -178,7 +272,7 @@ def update_campaign(company_id: str, campaign_id: str, body: CampaignUpdate, db:
     # bloqueios por estado
     immutable_when_running = {"running", "paused", "done", "cancelled"}
     if camp.status in immutable_when_running:
-        # você pode afrouxar/ajustar isso depois, mas aqui é “safe by default”
+        # “safe by default”
         forbidden = {"template_id", "mode", "context", "rate_per_min", "scheduled_at", "name"}
         touching = forbidden.intersection(set(data.keys()))
         if touching:
@@ -325,6 +419,181 @@ def add_targets_emails(
 
     db.commit()
     return {"ok": True, "added": int(added)}
+
+
+@router.post("/{campaign_id}/targets/upload", operation_id="campaigns_targets_upload")
+async def upload_targets_file(
+    company_id: str,
+    campaign_id: str,
+    file: UploadFile = File(...),
+    email_column: str = Query(default="email", description="Nome da coluna do e-mail (ex: email)"),
+    name_column: str = Query(default="nome", description="Nome da coluna do nome (ex: nome)"),
+    limit: int = Query(default=5000, ge=1, le=50000, description="Máximo de linhas lidas"),
+    db: Session = Depends(get_db),
+):
+    """
+    Upload CSV/XLSX:
+    - A coluna `email_column` vira destination (CampaignTarget.email)
+    - As demais colunas viram `payload` (variáveis do template: {{coluna}})
+    """
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Arquivo vazio")
+
+    rows = _parse_upload_file(file, raw, limit)
+    if not rows:
+        raise HTTPException(status_code=400, detail="Nenhuma linha válida encontrada")
+
+    email_col = (email_column or "email").strip()
+    name_col = (name_column or "nome").strip()
+
+    existing_emails = set(
+        (e or "").lower()
+        for (e,) in db.query(CampaignTarget.email)
+        .filter(CampaignTarget.campaign_id == camp.id)
+        .filter(CampaignTarget.email.isnot(None))
+        .all()
+    )
+
+    added = 0
+    skipped_no_email = 0
+    skipped_duplicate = 0
+    skipped_invalid = 0
+    errors: List[str] = []
+
+    for idx, row in enumerate(rows, start=1):
+        email_val = None
+        if email_col in row:
+            email_val = row.get(email_col)
+        else:
+            for k in row.keys():
+                if k.strip().lower() == email_col.strip().lower():
+                    email_val = row.get(k)
+                    break
+
+        email_str = (email_val or "").strip()
+        if not email_str:
+            skipped_no_email += 1
+            continue
+
+        email_key = email_str.lower()
+        if email_key in existing_emails:
+            skipped_duplicate += 1
+            continue
+
+        payload: Dict[str, Any] = {}
+        for k, v in row.items():
+            if not k:
+                continue
+            if k.strip().lower() == email_col.strip().lower():
+                continue
+
+            if name_col and k.strip().lower() == name_col.strip().lower():
+                payload.setdefault("nome", (v or "").strip())
+                continue
+
+            payload[_normalize_header(k)] = (v or "").strip()
+
+        t = CampaignTarget(
+            campaign_id=camp.id,
+            client_id=None,
+            email=email_str,
+            payload=payload or {},
+        )
+
+        try:
+            # ✅ savepoint: se der unique/erro em uma linha, não mata o batch todo
+            with db.begin_nested():
+                db.add(t)
+                db.flush()
+
+            existing_emails.add(email_key)
+            added += 1
+        except IntegrityError:
+            skipped_duplicate += 1
+        except Exception as e:
+            skipped_invalid += 1
+            errors.append(f"linha {idx}: {str(e)}")
+
+    # se adicionou via upload, marca mode upload (opcional)
+    if added > 0 and camp.mode != "upload":
+        camp.mode = "upload"
+
+    db.commit()
+
+    return {
+        "ok": True,
+        "added": int(added),
+        "skipped_no_email": int(skipped_no_email),
+        "skipped_duplicate": int(skipped_duplicate),
+        "skipped_invalid": int(skipped_invalid),
+        "errors": errors[:20],
+        "note": "As colunas (exceto email) viram variáveis do template via {{coluna}}. Use headers exatamente como no template.",
+    }
+    
+@router.get("/{campaign_id}/targets", operation_id="campaigns_targets_list")
+def list_targets(
+    company_id: str,
+    campaign_id: str,
+    limit: int = Query(default=200, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
+
+    q = (
+        db.query(CampaignTarget)
+        .filter(CampaignTarget.campaign_id == camp.id)
+        .order_by(CampaignTarget.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+
+    items = q.all()
+
+    # resposta simples (sem schema novo por enquanto)
+    return {
+        "ok": True,
+        "campaign_id": str(camp.id),
+        "count": len(items),
+        "items": [
+            {
+                "id": str(t.id),
+                "campaign_id": str(t.campaign_id),
+                "client_id": str(t.client_id) if t.client_id else None,
+                "email": t.email,
+                "payload": t.payload or {},
+                "created_at": t.created_at,
+            }
+            for t in items
+        ],
+    }
+
+
+@router.delete("/{campaign_id}/targets", operation_id="campaigns_targets_clear")
+def clear_targets(
+    company_id: str,
+    campaign_id: str,
+    db: Session = Depends(get_db),
+):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
+
+    if camp.status in ("running", "paused"):
+        raise HTTPException(status_code=400, detail="Não pode limpar targets com campanha em execução/pausada")
+
+    deleted = (
+        db.query(CampaignTarget)
+        .filter(CampaignTarget.campaign_id == camp.id)
+        .delete(synchronize_session=False)
+    )
+
+    # opcional: se quiser “voltar” modo
+    # camp.mode = "selected"
+
+    db.commit()
+    return {"ok": True, "deleted": int(deleted)}
 
 
 # =========================

@@ -1,15 +1,14 @@
 # app/routers/campaign.py
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
-from io import BytesIO
-import csv
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import func
-from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.database_.database import SessionLocal
 from app.schemas.campaign import (
@@ -30,10 +29,8 @@ from app.models.email_log import EmailLog
 
 from app.workers.tasks import send_email_job
 
-try:
-    import openpyxl  # pip install openpyxl
-except Exception:
-    openpyxl = None
+# Reuso do parser CSV/XLSX (o mesmo da fase B)
+from app.services.upload_parser import parse_upload_file, normalize_header
 
 
 router = APIRouter(prefix="/empresas/{company_id}/campanhas", tags=["Campanhas"])
@@ -71,10 +68,14 @@ def _ensure_campaign_company(db: Session, company_id: str, campaign_id: str) -> 
     return camp
 
 
-def _ensure_template_exists(db: Session, template_id: str) -> EmailTemplate:
-    tpl = db.query(EmailTemplate).filter(EmailTemplate.id == template_id).first()
+def _ensure_template_exists(db: Session, company_id: str, template_id: str) -> EmailTemplate:
+    tpl = (
+        db.query(EmailTemplate)
+        .filter(EmailTemplate.id == template_id, EmailTemplate.company_id == company_id)
+        .first()
+    )
     if not tpl:
-        raise HTTPException(status_code=400, detail="template_id inválido")
+        raise HTTPException(status_code=400, detail="template_id inválido (não existe ou não pertence à empresa)")
     return tpl
 
 
@@ -120,8 +121,176 @@ def _recalc_run_stats(db: Session, run_id: str) -> Dict[str, Any]:
     return _normalize_stats(by_status)
 
 
-def _persist_run_totals(db: Session, run: CampaignRun) -> Dict[str, Any]:
+def _normalize_var_key(h: str) -> str:
+    """
+    Converte header em chave amigável pra {{variavel}}:
+    - trim + remove BOM
+    - lower
+    - espaços -> _
+    - remove chars estranhos
+    """
+    s = normalize_header(h)
+    s = s.strip().lower()
+    s = s.replace(" ", "_")
+    s = re.sub(r"[^a-z0-9_]+", "", s)
+    return s
+
+
+# ======================================================
+# PREVIEW (Wizard de Campanhas - Fase C)
+# ======================================================
+
+@router.post("/preview-upload", operation_id="campaigns_preview_upload")
+async def preview_upload_file(
+    company_id: str,
+    file: UploadFile = File(...),
+    email_column: str = Query(default="email", description="Nome da coluna do e-mail (ex: email)"),
+    limit: int = Query(default=5000, ge=1, le=50000, description="Máximo de linhas lidas"),
+):
+    """
+    Lê CSV/XLSX e devolve:
+    - headers detectados
+    - amostra (primeiras 10 linhas)
+    - variáveis sugeridas (todas as colunas exceto email)
+    - contadores (total lidas, sem email)
+    """
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Arquivo vazio")
+
+    try:
+        rows = parse_upload_file(file.filename or "", raw, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not rows:
+        raise HTTPException(status_code=400, detail="Nenhuma linha válida encontrada")
+
+    # headers (união das keys das primeiras linhas)
+    headers_set = set()
+    for r in rows[:50]:
+        headers_set.update([normalize_header(k) for k in (r or {}).keys() if k])
+
+    headers = sorted([h for h in headers_set if h])
+
+    email_col = (email_column or "email").strip()
+    email_col_l = email_col.lower()
+
+    without_email = 0
+    normalized_rows: List[Dict[str, Any]] = []
+    for r in rows:
+        # normaliza chaves para variáveis
+        nr: Dict[str, Any] = {}
+        for k, v in (r or {}).items():
+            nk = _normalize_var_key(k)
+            if not nk:
+                continue
+            nr[nk] = (v or "").strip() if isinstance(v, str) else ("" if v is None else str(v))
+
+        # checa email (case-insensitive)
+        email_val = None
+        if email_col in r:
+            email_val = r.get(email_col)
+        else:
+            for k in r.keys():
+                if (k or "").strip().lower() == email_col_l:
+                    email_val = r.get(k)
+                    break
+
+        email_str = (email_val or "").strip() if isinstance(email_val, str) else ("" if email_val is None else str(email_val).strip())
+        if not email_str:
+            without_email += 1
+
+        normalized_rows.append(nr)
+
+    # variáveis sugeridas: headers normalizados exceto email
+    vars_suggested = sorted(
+        {k for r in normalized_rows[:200] for k in r.keys()} - {email_col_l}
+    )
+
+    sample = normalized_rows[:10]
+
+    return {
+        "ok": True,
+        "filename": file.filename,
+        "total_rows": int(len(rows)),
+        "rows_missing_email": int(without_email),
+        "headers_detected": headers,
+        "variables_suggested": vars_suggested,
+        "sample_rows": sample,
+        "note": "variables_suggested são as chaves que você pode usar no template via {{chave}} (exceto email).",
+    }
+
+
+@router.post("/preview-render", operation_id="campaigns_preview_render")
+def preview_render(
+    company_id: str,
+    template_id: str = Query(..., description="ID do template da empresa"),
+    context: Dict[str, Any] = None,
+    row: Dict[str, Any] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Renderiza assunto/corpo do template combinando:
+    - context (da campanha)
+    - row (linha da planilha / payload do target)
+    Retorna subject_rendered/body_rendered e as variáveis usadas.
+    """
+    tpl = _ensure_template_exists(db, company_id, template_id)
+
+    ctx: Dict[str, Any] = dict(context or {})
+    # normaliza row keys para {{variavel}}
+    for k, v in (row or {}).items():
+        nk = _normalize_var_key(k)
+        if not nk:
+            continue
+        ctx[nk] = v
+
+    subject_rendered = _render_placeholders(tpl.assunto or "", ctx)
+    body_rendered = _render_placeholders(tpl.corpo_html or "", ctx)
+
+    return {
+        "ok": True,
+        "template_id": str(tpl.id),
+        "used_context": ctx,
+        "subject_rendered": subject_rendered,
+        "body_rendered": body_rendered,
+    }
+
+
+# ======================================================
+# RUNS (coloca antes de "/{campaign_id}" pra evitar conflito)
+# ======================================================
+
+@router.get("/runs/{run_id}", response_model=CampaignRunOut, operation_id="campaigns_runs_get")
+def get_run(company_id: str, run_id: str, db: Session = Depends(get_db)):
+    run = (
+        db.query(CampaignRun)
+        .join(Campaign, Campaign.id == CampaignRun.campaign_id)
+        .filter(Campaign.company_id == company_id)
+        .filter(CampaignRun.id == run_id)
+        .first()
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return run
+
+
+@router.get("/runs/{run_id}/stats", operation_id="campaigns_runs_stats")
+def get_run_stats(company_id: str, run_id: str, db: Session = Depends(get_db)):
+    run = (
+        db.query(CampaignRun)
+        .join(Campaign, Campaign.id == CampaignRun.campaign_id)
+        .filter(Campaign.company_id == company_id)
+        .filter(CampaignRun.id == run_id)
+        .first()
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
     stats = _recalc_run_stats(db, str(run.id))
+
+    # persiste no totals (bom pro dashboard)
     run.totals = {
         "total": stats["total"],
         "sent": stats["sent"],
@@ -132,93 +301,10 @@ def _persist_run_totals(db: Session, run: CampaignRun) -> Dict[str, Any]:
     }
     db.commit()
     db.refresh(run)
-    return stats
 
-
-# -------------------------
-# Upload helpers (CSV/XLSX)
-# -------------------------
-
-def _normalize_header(h: Any) -> str:
-    return str(h or "").strip()
-
-
-def _guess_delimiter(sample: str) -> str:
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=";,")
-        return dialect.delimiter
-    except Exception:
-        return ";" if sample.count(";") > sample.count(",") else ","
-
-
-def _parse_csv_bytes(data: bytes, limit: int) -> List[Dict[str, Any]]:
-    text = data.decode("utf-8-sig", errors="replace")
-    sample = text[:2048]
-    delim = _guess_delimiter(sample)
-
-    rows: List[Dict[str, Any]] = []
-    reader = csv.DictReader(text.splitlines(), delimiter=delim)
-    for i, row in enumerate(reader, start=1):
-        if i > limit:
-            break
-        if not row:
-            continue
-        clean = {_normalize_header(k): (v if v is not None else "") for k, v in row.items()}
-        rows.append(clean)
-    return rows
-
-
-def _parse_xlsx_bytes(data: bytes, limit: int) -> List[Dict[str, Any]]:
-    if openpyxl is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Upload XLSX não disponível (dependência openpyxl não instalada). Use CSV ou instale openpyxl.",
-        )
-
-    wb = openpyxl.load_workbook(BytesIO(data), read_only=True, data_only=True)
-    ws = wb.active
-
-    it = ws.iter_rows(values_only=True)
-    try:
-        headers_raw = next(it)
-    except StopIteration:
-        return []
-
-    headers = [_normalize_header(h) for h in (headers_raw or [])]
-
-    rows: List[Dict[str, Any]] = []
-    for idx, values in enumerate(it, start=1):
-        if idx > limit:
-            break
-        if values is None:
-            continue
-
-        row_dict: Dict[str, Any] = {}
-        for col_i, val in enumerate(values):
-            if col_i >= len(headers):
-                continue
-            key = headers[col_i]
-            if not key:
-                continue
-            row_dict[key] = "" if val is None else str(val).strip()
-
-        if row_dict:
-            rows.append(row_dict)
-
-    return rows
-
-
-def _parse_upload_file(file: UploadFile, data: bytes, limit: int) -> List[Dict[str, Any]]:
-    filename = (file.filename or "").lower()
-    ctype = (file.content_type or "").lower()
-
-    if filename.endswith(".csv") or "csv" in ctype:
-        return _parse_csv_bytes(data, limit)
-
-    if filename.endswith(".xlsx") or "spreadsheet" in ctype or "excel" in ctype:
-        return _parse_xlsx_bytes(data, limit)
-
-    raise HTTPException(status_code=400, detail="Formato inválido. Envie CSV ou XLSX.")
+    out = dict(stats)
+    out.update({"run_id": str(run.id), "campaign_id": str(run.campaign_id), "run_status": run.status})
+    return out
 
 
 # =========================
@@ -238,9 +324,8 @@ def list_campaigns(company_id: str, db: Session = Depends(get_db)):
 
 @router.post("/", response_model=CampaignOut, operation_id="campaigns_create")
 def create_campaign(company_id: str, body: CampaignCreate, db: Session = Depends(get_db)):
-    _ensure_template_exists(db, str(body.template_id))
+    _ensure_template_exists(db, company_id, str(body.template_id))
 
-    # se veio agendada, nasce scheduled; senão, draft
     initial_status = "scheduled" if body.scheduled_at is not None else "draft"
 
     camp = Campaign(
@@ -269,10 +354,8 @@ def update_campaign(company_id: str, campaign_id: str, body: CampaignUpdate, db:
     camp = _ensure_campaign_company(db, company_id, campaign_id)
     data = body.model_dump(exclude_unset=True)
 
-    # bloqueios por estado
     immutable_when_running = {"running", "paused", "done", "cancelled"}
     if camp.status in immutable_when_running:
-        # “safe by default”
         forbidden = {"template_id", "mode", "context", "rate_per_min", "scheduled_at", "name"}
         touching = forbidden.intersection(set(data.keys()))
         if touching:
@@ -281,9 +364,8 @@ def update_campaign(company_id: str, campaign_id: str, body: CampaignUpdate, db:
                 detail=f"Não pode alterar {sorted(list(touching))} com status={camp.status}",
             )
 
-    # valida template se mudar
     if "template_id" in data:
-        _ensure_template_exists(db, str(data["template_id"]))
+        _ensure_template_exists(db, company_id, str(data["template_id"]))
 
     scheduled_changed = "scheduled_at" in data
     new_scheduled_at = data.get("scheduled_at", None)
@@ -291,7 +373,6 @@ def update_campaign(company_id: str, campaign_id: str, body: CampaignUpdate, db:
     for k, v in data.items():
         setattr(camp, k, v)
 
-    # regra automática de status baseada no scheduled_at
     if scheduled_changed:
         if new_scheduled_at is not None:
             if camp.status in ("draft", "ready"):
@@ -442,7 +523,11 @@ async def upload_targets_file(
     if not raw:
         raise HTTPException(status_code=400, detail="Arquivo vazio")
 
-    rows = _parse_upload_file(file, raw, limit)
+    try:
+        rows = parse_upload_file(file.filename or "", raw, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     if not rows:
         raise HTTPException(status_code=400, detail="Nenhuma linha válida encontrada")
 
@@ -450,11 +535,12 @@ async def upload_targets_file(
     name_col = (name_column or "nome").strip()
 
     existing_emails = set(
-        (e or "").lower()
+        e.lower()
         for (e,) in db.query(CampaignTarget.email)
         .filter(CampaignTarget.campaign_id == camp.id)
         .filter(CampaignTarget.email.isnot(None))
         .all()
+        if e
     )
 
     added = 0
@@ -464,16 +550,17 @@ async def upload_targets_file(
     errors: List[str] = []
 
     for idx, row in enumerate(rows, start=1):
+        # email case-insensitive
         email_val = None
         if email_col in row:
             email_val = row.get(email_col)
         else:
             for k in row.keys():
-                if k.strip().lower() == email_col.strip().lower():
+                if (k or "").strip().lower() == email_col.strip().lower():
                     email_val = row.get(k)
                     break
 
-        email_str = (email_val or "").strip()
+        email_str = (email_val or "").strip() if isinstance(email_val, str) else ("" if email_val is None else str(email_val).strip())
         if not email_str:
             skipped_no_email += 1
             continue
@@ -484,17 +571,19 @@ async def upload_targets_file(
             continue
 
         payload: Dict[str, Any] = {}
-        for k, v in row.items():
+        for k, v in (row or {}).items():
             if not k:
                 continue
-            if k.strip().lower() == email_col.strip().lower():
+            kl = (k or "").strip().lower()
+            if kl == email_col.strip().lower():
                 continue
 
-            if name_col and k.strip().lower() == name_col.strip().lower():
-                payload.setdefault("nome", (v or "").strip())
+            # coluna de nome -> payload["nome"]
+            if name_col and kl == name_col.strip().lower():
+                payload.setdefault("nome", (v or "").strip() if isinstance(v, str) else ("" if v is None else str(v)))
                 continue
 
-            payload[_normalize_header(k)] = (v or "").strip()
+            payload[_normalize_var_key(k)] = (v or "").strip() if isinstance(v, str) else ("" if v is None else str(v))
 
         t = CampaignTarget(
             campaign_id=camp.id,
@@ -503,21 +592,19 @@ async def upload_targets_file(
             payload=payload or {},
         )
 
+        db.add(t)
         try:
-            # ✅ savepoint: se der unique/erro em uma linha, não mata o batch todo
-            with db.begin_nested():
-                db.add(t)
-                db.flush()
-
+            db.flush()
             existing_emails.add(email_key)
             added += 1
         except IntegrityError:
+            db.rollback()
             skipped_duplicate += 1
         except Exception as e:
+            db.rollback()
             skipped_invalid += 1
             errors.append(f"linha {idx}: {str(e)}")
 
-    # se adicionou via upload, marca mode upload (opcional)
     if added > 0 and camp.mode != "upload":
         camp.mode = "upload"
 
@@ -530,70 +617,8 @@ async def upload_targets_file(
         "skipped_duplicate": int(skipped_duplicate),
         "skipped_invalid": int(skipped_invalid),
         "errors": errors[:20],
-        "note": "As colunas (exceto email) viram variáveis do template via {{coluna}}. Use headers exatamente como no template.",
+        "note": "As colunas (exceto email) viram variáveis do template via {{coluna}}.",
     }
-    
-@router.get("/{campaign_id}/targets", operation_id="campaigns_targets_list")
-def list_targets(
-    company_id: str,
-    campaign_id: str,
-    limit: int = Query(default=200, ge=1, le=2000),
-    offset: int = Query(default=0, ge=0),
-    db: Session = Depends(get_db),
-):
-    camp = _ensure_campaign_company(db, company_id, campaign_id)
-
-    q = (
-        db.query(CampaignTarget)
-        .filter(CampaignTarget.campaign_id == camp.id)
-        .order_by(CampaignTarget.created_at.desc())
-        .offset(offset)
-        .limit(limit)
-    )
-
-    items = q.all()
-
-    # resposta simples (sem schema novo por enquanto)
-    return {
-        "ok": True,
-        "campaign_id": str(camp.id),
-        "count": len(items),
-        "items": [
-            {
-                "id": str(t.id),
-                "campaign_id": str(t.campaign_id),
-                "client_id": str(t.client_id) if t.client_id else None,
-                "email": t.email,
-                "payload": t.payload or {},
-                "created_at": t.created_at,
-            }
-            for t in items
-        ],
-    }
-
-
-@router.delete("/{campaign_id}/targets", operation_id="campaigns_targets_clear")
-def clear_targets(
-    company_id: str,
-    campaign_id: str,
-    db: Session = Depends(get_db),
-):
-    camp = _ensure_campaign_company(db, company_id, campaign_id)
-
-    if camp.status in ("running", "paused"):
-        raise HTTPException(status_code=400, detail="Não pode limpar targets com campanha em execução/pausada")
-
-    deleted = (
-        db.query(CampaignTarget)
-        .filter(CampaignTarget.campaign_id == camp.id)
-        .delete(synchronize_session=False)
-    )
-
-    # opcional: se quiser “voltar” modo
-    # camp.mode = "selected"
-
-    db.commit()
-    return {"ok": True, "deleted": int(deleted)}
 
 
 # =========================
@@ -604,22 +629,18 @@ def clear_targets(
 def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
     camp = _ensure_campaign_company(db, company_id, campaign_id)
 
-    # permite start manual também se estiver scheduled
     if camp.status not in ("draft", "ready", "scheduled"):
         raise HTTPException(
             status_code=400,
             detail=f"Campanha em status inválido para iniciar: {camp.status}",
         )
 
-    tpl = db.query(EmailTemplate).filter(EmailTemplate.id == camp.template_id).first()
-    if not tpl:
-        raise HTTPException(status_code=400, detail="Template não encontrado")
+    tpl = _ensure_template_exists(db, company_id, str(camp.template_id))
 
     targets = db.query(CampaignTarget).filter(CampaignTarget.campaign_id == camp.id).all()
     if not targets:
         raise HTTPException(status_code=400, detail="Campanha sem targets")
 
-    # cria run
     run = CampaignRun(campaign_id=camp.id, status="running", totals={})
     db.add(run)
     camp.status = "running"
@@ -627,7 +648,6 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
     db.refresh(run)
     db.refresh(camp)
 
-    # cria logs (SEM enfileirar ainda)
     created_logs = 0
     now = datetime.now(timezone.utc)
     queued_log_ids: List[str] = []
@@ -646,7 +666,7 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                 continue
 
             to_email = getattr(c, "email", None)
-            to_name = getattr(c, "nome", None) or getattr(c, "name", None)
+            to_name = getattr(c, "nome", None)
 
             if getattr(c, "nome", None) is not None:
                 ctx.setdefault("nome", c.nome)
@@ -658,16 +678,8 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
         if not to_email:
             continue
 
-        subject_tpl = getattr(tpl, "assunto", None) or getattr(tpl, "subject", None) or ""
-        body_tpl = (
-            getattr(tpl, "html", None)
-            or getattr(tpl, "body_html", None)
-            or getattr(tpl, "body", None)
-            or ""
-        )
-
-        subject_rendered = _render_placeholders(subject_tpl, ctx)
-        body_rendered = _render_placeholders(body_tpl, ctx)
+        subject_rendered = _render_placeholders(tpl.assunto or "", ctx)
+        body_rendered = _render_placeholders(tpl.corpo_html or "", ctx)
 
         log = EmailLog(
             company_id=company_id,
@@ -687,18 +699,15 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
         )
 
         db.add(log)
-        db.flush()  # garante log.id gerado
+        db.flush()
         queued_log_ids.append(str(log.id))
         created_logs += 1
 
-    # commit antes de enfileirar (evita job "não achou log" em corrida)
     db.commit()
 
-    # enfileira depois do commit
     for log_id in queued_log_ids:
         send_email_job.delay(log_id)
 
-    # salva totais iniciais
     run = db.query(CampaignRun).filter(CampaignRun.id == run.id).first()
     if run:
         run.totals = {
@@ -728,55 +737,9 @@ def list_campaign_runs(company_id: str, campaign_id: str, db: Session = Depends(
     return runs
 
 
-@router.get("/runs/{run_id}", response_model=CampaignRunOut, operation_id="campaigns_runs_get")
-def get_run(company_id: str, run_id: str, db: Session = Depends(get_db)):
-    run = (
-        db.query(CampaignRun)
-        .join(Campaign, Campaign.id == CampaignRun.campaign_id)
-        .filter(Campaign.company_id == company_id)
-        .filter(CampaignRun.id == run_id)
-        .first()
-    )
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
-    return run
-
-
 # =========================
 # STATS (REAL TIME)
 # =========================
-
-@router.get("/runs/{run_id}/stats", operation_id="campaigns_runs_stats")
-def get_run_stats(company_id: str, run_id: str, db: Session = Depends(get_db)):
-    run = (
-        db.query(CampaignRun)
-        .join(Campaign, Campaign.id == CampaignRun.campaign_id)
-        .filter(Campaign.company_id == company_id)
-        .filter(CampaignRun.id == run_id)
-        .first()
-    )
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
-
-    # recalcula em tempo real
-    stats = _recalc_run_stats(db, str(run.id))
-
-    # persiste no run.totals (bom pra dashboard e histórico)
-    run.totals = {
-        "total": stats["total"],
-        "sent": stats["sent"],
-        "failed": stats["failed"],
-        "cancelled": stats["cancelled"],
-        "pending": stats["pending"],
-        "by_status": stats["by_status"],
-    }
-    db.commit()
-    db.refresh(run)
-
-    out = dict(stats)
-    out.update({"run_id": str(run.id), "campaign_id": str(run.campaign_id), "run_status": run.status})
-    return out
-
 
 @router.get("/{campaign_id}/stats", operation_id="campaigns_stats")
 def get_campaign_stats(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
@@ -852,21 +815,19 @@ def resume_campaign(company_id: str, campaign_id: str, db: Session = Depends(get
         .all()
     )
 
-    enqueued = 0
     ids_to_enqueue: List[str] = []
     for log in logs:
         log.status = "QUEUED"
         log.error_message = None
         db.flush()
         ids_to_enqueue.append(str(log.id))
-        enqueued += 1
 
     db.commit()
 
     for log_id in ids_to_enqueue:
         send_email_job.delay(log_id)
 
-    return {"ok": True, "status": "running", "enqueued": int(enqueued)}
+    return {"ok": True, "status": "running", "enqueued": int(len(ids_to_enqueue))}
 
 
 @router.post("/{campaign_id}/cancel", operation_id="campaigns_cancel")

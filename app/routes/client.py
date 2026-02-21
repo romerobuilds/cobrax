@@ -1,12 +1,14 @@
 # app/routes/client.py
 from __future__ import annotations
 
-from typing import List, Optional
+import csv
+import io
+from typing import List, Dict, Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
-from sqlalchemy import func
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Query
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.core.deps import get_current_user
 from app.database_.database import get_db
@@ -15,7 +17,9 @@ from app.models.company import Company
 from app.models.user import User
 from app.schemas.client import ClientCreate, ClientPublic, ClientUpdate
 
-from app.services.upload_parser import parse_upload_file
+# XLSX
+from openpyxl import load_workbook
+
 
 router = APIRouter(prefix="/empresas/{company_id}/clientes", tags=["Clientes"])
 
@@ -46,24 +50,96 @@ def _get_client_or_404(db: Session, company_id: UUID, client_id: UUID, user_id: 
     return client
 
 
-def _get_ci(row: dict, colname: str) -> Optional[str]:
-    """Busca valor por coluna case-insensitive."""
-    if not colname:
+# -------------------------
+# Upload helpers
+# -------------------------
+
+def _normalize_header(s: str) -> str:
+    return (s or "").strip()
+
+
+def _parse_csv(raw: bytes, limit: int) -> List[Dict[str, str]]:
+    text = raw.decode("utf-8-sig", errors="ignore")
+    reader = csv.DictReader(io.StringIO(text))
+    rows: List[Dict[str, str]] = []
+    for i, row in enumerate(reader):
+        if i >= limit:
+            break
+        if not row:
+            continue
+        clean: Dict[str, str] = {}
+        for k, v in row.items():
+            hk = _normalize_header(k)
+            if not hk:
+                continue
+            clean[hk] = "" if v is None else str(v).strip()
+        if clean:
+            rows.append(clean)
+    return rows
+
+
+def _parse_xlsx(raw: bytes, limit: int) -> List[Dict[str, str]]:
+    wb = load_workbook(filename=io.BytesIO(raw), read_only=True, data_only=True)
+    ws = wb.active
+
+    rows_iter = ws.iter_rows(values_only=True)
+    try:
+        headers = next(rows_iter)
+    except StopIteration:
+        return []
+
+    headers_norm = [_normalize_header(str(h) if h is not None else "") for h in headers]
+    rows: List[Dict[str, str]] = []
+
+    for i, values in enumerate(rows_iter):
+        if i >= limit:
+            break
+        row: Dict[str, str] = {}
+        for idx, h in enumerate(headers_norm):
+            if not h:
+                continue
+            v = values[idx] if idx < len(values) else None
+            row[h] = "" if v is None else str(v).strip()
+        if row:
+            rows.append(row)
+
+    return rows
+
+
+def _parse_upload_file(file: UploadFile, raw: bytes, limit: int) -> List[Dict[str, str]]:
+    filename = (file.filename or "").lower()
+    ctype = (file.content_type or "").lower()
+
+    if filename.endswith(".csv") or "csv" in ctype:
+        return _parse_csv(raw, limit)
+
+    if filename.endswith(".xlsx") or "spreadsheet" in ctype or "excel" in ctype:
+        return _parse_xlsx(raw, limit)
+
+    raise HTTPException(status_code=400, detail="Formato inválido. Envie CSV ou XLSX.")
+
+
+def _find_value_ci(row: Dict[str, Any], col: str) -> Optional[str]:
+    """Busca a coluna por match case-insensitive."""
+    col = (col or "").strip()
+    if not col:
         return None
-    if colname in row:
-        return row.get(colname)
-    target = colname.strip().lower()
+
+    if col in row:
+        return row.get(col)
+
+    target = col.lower()
     for k in row.keys():
         if (k or "").strip().lower() == target:
             return row.get(k)
     return None
 
 
-# =========================
+# -------------------------
 # CRUD
-# =========================
+# -------------------------
 
-@router.post("/", response_model=ClientPublic, status_code=status.HTTP_201_CREATED, operation_id="clients_create")
+@router.post("/", response_model=ClientPublic, status_code=status.HTTP_201_CREATED)
 def criar_cliente(
     company_id: UUID,
     payload: ClientCreate,
@@ -72,11 +148,9 @@ def criar_cliente(
 ):
     _get_company_or_404(db, company_id, user.id)
 
-    # evita duplicado por email dentro da mesma empresa (case-insensitive)
     existe = (
         db.query(Client)
-        .filter(Client.company_id == company_id)
-        .filter(func.lower(Client.email) == func.lower(str(payload.email)))
+        .filter(Client.company_id == company_id, Client.email == str(payload.email))
         .first()
     )
     if existe:
@@ -95,7 +169,7 @@ def criar_cliente(
     return client
 
 
-@router.get("/", response_model=List[ClientPublic], operation_id="clients_list")
+@router.get("/", response_model=List[ClientPublic])
 def listar_clientes(
     company_id: UUID,
     db: Session = Depends(get_db),
@@ -111,7 +185,7 @@ def listar_clientes(
     )
 
 
-@router.get("/{client_id}", response_model=ClientPublic, operation_id="clients_get")
+@router.get("/{client_id}", response_model=ClientPublic)
 def obter_cliente(
     company_id: UUID,
     client_id: UUID,
@@ -122,7 +196,7 @@ def obter_cliente(
     return _get_client_or_404(db, company_id, client_id, user.id)
 
 
-@router.put("/{client_id}", response_model=ClientPublic, operation_id="clients_update")
+@router.put("/{client_id}", response_model=ClientPublic)
 def atualizar_cliente(
     company_id: UUID,
     client_id: UUID,
@@ -133,13 +207,14 @@ def atualizar_cliente(
     _get_company_or_404(db, company_id, user.id)
     client = _get_client_or_404(db, company_id, client_id, user.id)
 
-    # se for trocar email, valida duplicidade (case-insensitive)
     if payload.email and str(payload.email) != client.email:
         existe = (
             db.query(Client)
-            .filter(Client.company_id == company_id)
-            .filter(func.lower(Client.email) == func.lower(str(payload.email)))
-            .filter(Client.id != client.id)
+            .filter(
+                Client.company_id == company_id,
+                Client.email == str(payload.email),
+                Client.id != client.id,
+            )
             .first()
         )
         if existe:
@@ -157,7 +232,7 @@ def atualizar_cliente(
     return client
 
 
-@router.delete("/{client_id}", status_code=status.HTTP_204_NO_CONTENT, operation_id="clients_delete")
+@router.delete("/{client_id}", status_code=status.HTTP_204_NO_CONTENT)
 def deletar_cliente(
     company_id: UUID,
     client_id: UUID,
@@ -173,25 +248,27 @@ def deletar_cliente(
 
 
 # =========================
-# UPLOAD (Fase B)
+# UPLOAD (CSV/XLSX)
 # =========================
 
 @router.post("/upload", operation_id="clients_upload")
-async def upload_clientes(
+async def upload_clients_file(
     company_id: UUID,
     file: UploadFile = File(...),
     email_column: str = Query(default="email", description="Nome da coluna do e-mail (ex: email)"),
-    name_column: str = Query(default="nome", description="Nome da coluna do nome (ex: nome)"),
-    phone_column: str = Query(default="telefone", description="Nome da coluna do telefone (ex: telefone)"),
+    nome_column: str = Query(default="nome", description="Nome da coluna do nome (ex: nome)"),
+    telefone_column: str = Query(default="telefone", description="Nome da coluna do telefone (ex: telefone)"),
     limit: int = Query(default=5000, ge=1, le=50000, description="Máximo de linhas lidas"),
-    upsert: bool = Query(default=True, description="Se true, atualiza cliente existente por email"),
+    update_existing: bool = Query(default=False, description="Se true, atualiza cliente existente pelo e-mail"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """
-    Upload CSV/XLSX para criar/atualizar clientes em massa.
-    - Identificador: email (case-insensitive) dentro da empresa
-    - upsert=true: atualiza nome/telefone se vierem preenchidos
+    Upload CSV/XLSX de clientes:
+    - email_column: obrigatório por linha
+    - nome/telefone opcionais (se não vierem, deixa como está)
+    - dedupe por email dentro da empresa
+    - update_existing=true => atualiza nome/telefone do cliente existente
     """
     _get_company_or_404(db, company_id, user.id)
 
@@ -199,88 +276,105 @@ async def upload_clientes(
     if not raw:
         raise HTTPException(status_code=400, detail="Arquivo vazio")
 
-    try:
-        rows = parse_upload_file(file.filename or "", raw, limit=limit)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
+    rows = _parse_upload_file(file, raw, limit)
     if not rows:
         raise HTTPException(status_code=400, detail="Nenhuma linha válida encontrada")
 
     email_col = (email_column or "email").strip()
-    name_col = (name_column or "nome").strip()
-    phone_col = (phone_column or "telefone").strip()
+    nome_col = (nome_column or "nome").strip()
+    tel_col = (telefone_column or "telefone").strip()
 
-    added = 0
+    # cache de emails existentes
+    existing = {
+        (e or "").lower(): cid
+        for (e, cid) in db.query(Client.email, Client.id)
+        .filter(Client.company_id == company_id, Client.owner_id == user.id)
+        .all()
+        if e
+    }
+
+    created = 0
     updated = 0
     skipped_no_email = 0
-    skipped_invalid = 0
-    skipped_duplicate_when_no_upsert = 0
+    skipped_duplicate = 0
     errors: List[str] = []
 
     for idx, row in enumerate(rows, start=1):
-        email_val = _get_ci(row, email_col)
-        email_str = (email_val or "").strip()
-
-        if not email_str:
+        email_val = _find_value_ci(row, email_col)
+        email = (email_val or "").strip()
+        if not email:
             skipped_no_email += 1
             continue
 
-        nome_val = _get_ci(row, name_col)
-        tel_val = _get_ci(row, phone_col)
+        email_key = email.lower()
 
-        nome_str = (nome_val or "").strip()
-        tel_str = (tel_val or "").strip()
+        nome_val = _find_value_ci(row, nome_col)
+        telefone_val = _find_value_ci(row, tel_col)
 
-        try:
-            existing = (
+        nome = (nome_val or "").strip()
+        telefone = (telefone_val or "").strip()
+
+        if email_key in existing:
+            if not update_existing:
+                skipped_duplicate += 1
+                continue
+
+            # update existente
+            client_id = existing[email_key]
+            c = (
                 db.query(Client)
-                .filter(Client.company_id == company_id, Client.owner_id == user.id)
-                .filter(func.lower(Client.email) == func.lower(email_str))
+                .filter(
+                    Client.id == client_id,
+                    Client.company_id == company_id,
+                    Client.owner_id == user.id,
+                )
                 .first()
             )
+            if not c:
+                skipped_duplicate += 1
+                continue
 
-            if existing:
-                if not upsert:
-                    skipped_duplicate_when_no_upsert += 1
-                    continue
+            if nome:
+                c.nome = nome
+            if telefone:
+                c.telefone = telefone
 
-                # só atualiza se vier valor (não sobrescreve com vazio)
-                if nome_str:
-                    existing.nome = nome_str
-                if tel_str:
-                    existing.telefone = tel_str
+            updated += 1
+            continue
 
-                updated += 1
-            else:
-                # Se seu model exigir nome/telefone NOT NULL, usamos fallback seguro
-                c = Client(
-                    company_id=company_id,
-                    owner_id=user.id,
-                    nome=nome_str or "Sem nome",
-                    email=email_str,
-                    telefone=tel_str or "-",
-                )
-                db.add(c)
-                added += 1
+        # create novo
+        if not nome:
+            # se planilha não tiver nome, cria um fallback
+            nome = email.split("@")[0]
 
-            if (idx % 200) == 0:
-                db.flush()
+        c = Client(
+            nome=nome,
+            email=email,
+            telefone=telefone or None,
+            owner_id=user.id,
+            company_id=company_id,
+        )
 
+        db.add(c)
+        try:
+            db.flush()  # pega erros antes do commit
+            existing[email_key] = c.id
+            created += 1
+        except IntegrityError:
+            db.rollback()
+            skipped_duplicate += 1
         except Exception as e:
             db.rollback()
-            skipped_invalid += 1
             errors.append(f"linha {idx}: {str(e)}")
 
     db.commit()
 
     return {
         "ok": True,
-        "added": int(added),
+        "created": int(created),
         "updated": int(updated),
         "skipped_no_email": int(skipped_no_email),
-        "skipped_duplicate_when_no_upsert": int(skipped_duplicate_when_no_upsert),
-        "skipped_invalid": int(skipped_invalid),
+        "skipped_duplicate": int(skipped_duplicate),
         "errors": errors[:20],
-        "note": "Envie colunas: email, nome, telefone. upsert=true atualiza por email (case-insensitive).",
+        "note": "CSV/XLSX: email é obrigatório. update_existing=true atualiza nome/telefone do cliente existente pelo e-mail.",
     }

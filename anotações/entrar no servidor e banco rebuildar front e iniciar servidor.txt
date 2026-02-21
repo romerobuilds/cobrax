@@ -4,9 +4,9 @@ ssh cobrax@95.216.138.163
 --------------------------------------------------------------------------------
 
 2) Rebuild e subir
-docker compose down
-docker compose build --no-cache api worker
-docker compose up -d
+docker compose -f docker-compose.web.yml down
+docker compose -f docker-compose.web.yml build --no-cache
+docker compose -f docker-compose.web.yml up -d
 
 3) Checar logs
 docker compose logs -f api

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
@@ -11,7 +11,8 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field
 class ClientCreate(BaseModel):
     nome: str
     email: EmailStr
-    telefone: str
+    # ✅ telefone pode vir vazio/ausente (principalmente em upload)
+    telefone: Optional[str] = None
 
 
 class ClientUpdate(BaseModel):
@@ -28,7 +29,8 @@ class ClientPublic(BaseModel):
     owner_id: UUID
     nome: str
     email: EmailStr
-    telefone: str
+    # ✅ era str, agora aceita None e não quebra o response
+    telefone: Optional[str] = None
     created_at: datetime
 
 

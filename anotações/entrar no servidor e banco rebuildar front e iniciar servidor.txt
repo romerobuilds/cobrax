@@ -4,12 +4,13 @@ ssh cobrax@95.216.138.163
 --------------------------------------------------------------------------------
 
 2) Rebuild e subir
+cd ~/apps/cobrax-web
 docker compose -f docker-compose.web.yml down
-docker compose -f docker-compose.web.yml build --no-cache
-docker compose -f docker-compose.web.yml up -d
+docker compose -f docker-compose.web.yml up -d --build
+docker compose -f docker-compose.web.yml logs -f
 
 3) Checar logs
-docker compose logs -f api
+docker compose -f docker-compose.web.yml logs -f
 
 --------------------------------------------------------------------------------
 Entrar no Banco de dados (postgre)

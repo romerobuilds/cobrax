@@ -7,6 +7,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
+from datetime import datetime
+from typing import Optional, List, Literal
+from pydantic import BaseModel, Field
+
+RepeatType = Literal["none", "minutes", "hours", "days", "weeks"]
+
 
 def _as_utc(dt: datetime | None) -> datetime | None:
     if dt is None:
@@ -125,3 +131,35 @@ class CampaignRunOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+class CampaignScheduleIn(BaseModel):
+    is_enabled: bool = True
+
+    # quando começar (obrigatório pra agendar)
+    start_at: datetime
+
+    # timezone IANA
+    timezone: str = "America/Sao_Paulo"
+
+    # repetição
+    repeat_type: RepeatType = "none"
+    repeat_every: int = Field(default=0, ge=0)
+
+    # só pra weeks (0=seg ... 6=dom)
+    repeat_weekdays: Optional[List[int]] = None
+
+    # opcional: parar
+    end_at: Optional[datetime] = None
+    max_occurrences: Optional[int] = Field(default=None, ge=1)
+
+class CampaignScheduleOut(BaseModel):
+    is_schedule_enabled: bool
+    start_at: Optional[datetime] = None
+    next_run_at: Optional[datetime] = None
+    end_at: Optional[datetime] = None
+    max_occurrences: Optional[int] = None
+    occurrences: int
+    repeat_type: RepeatType
+    repeat_every: int
+    repeat_weekdays: Optional[List[int]] = None
+    timezone: str

@@ -18,6 +18,8 @@ from app.schemas.campaign import (
     CampaignTargetAddSelected,
     CampaignTargetAddEmails,
     CampaignRunOut,
+    CampaignScheduleIn,
+    CampaignScheduleOut,
 )
 
 from app.models.campaign import Campaign
@@ -47,6 +49,18 @@ def get_db():
 # -------------------------
 # Helpers
 # -------------------------
+
+def _parse_weekdays(s: str | None):
+    if not s:
+        return None
+    return [int(x) for x in s.split(",") if x.strip().isdigit()]
+
+def _weekdays_to_str(days: list[int] | None):
+    if not days:
+        return None
+    days = sorted({int(x) for x in days if 0 <= int(x) <= 6})
+    return ",".join(str(x) for x in days) if days else None
+
 
 def _render_placeholders(text: str, ctx: Dict[str, Any]) -> str:
     if not text:
@@ -137,6 +151,81 @@ def _normalize_var_key(h: str) -> str:
 
 
 # ======================================================
+# SCHEDULE (NOVO)
+# ======================================================
+
+@router.get("/{campaign_id}/schedule", response_model=CampaignScheduleOut)
+def get_schedule(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
+
+    return CampaignScheduleOut(
+        is_schedule_enabled=bool(getattr(camp, "is_schedule_enabled", False)),
+        start_at=getattr(camp, "start_at", None),
+        next_run_at=getattr(camp, "next_run_at", None),
+        end_at=getattr(camp, "end_at", None),
+        max_occurrences=getattr(camp, "max_occurrences", None),
+        occurrences=int(getattr(camp, "occurrences", 0) or 0),
+        repeat_type=getattr(camp, "repeat_type", None) or "none",
+        repeat_every=int(getattr(camp, "repeat_every", 0) or 0),
+        repeat_weekdays=_parse_weekdays(getattr(camp, "repeat_weekdays", None)),
+        timezone=getattr(camp, "timezone", None) or "America/Sao_Paulo",
+    )
+
+
+@router.post("/{campaign_id}/schedule", response_model=CampaignScheduleOut)
+def set_schedule(
+    company_id: str,
+    campaign_id: str,
+    payload: CampaignScheduleIn,
+    db: Session = Depends(get_db),
+):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
+
+    # validações
+    if payload.repeat_type != "none":
+        if payload.repeat_every <= 0:
+            raise HTTPException(status_code=400, detail="repeat_every deve ser > 0 quando repetir")
+        if payload.repeat_type == "weeks":
+            if not payload.repeat_weekdays:
+                raise HTTPException(status_code=400, detail="repeat_weekdays obrigatório para weeks")
+            for d in payload.repeat_weekdays:
+                if d < 0 or d > 6:
+                    raise HTTPException(status_code=400, detail="repeat_weekdays deve ser 0..6")
+
+    camp.is_schedule_enabled = bool(payload.is_enabled)
+
+    camp.start_at = payload.start_at
+    camp.next_run_at = payload.start_at  # primeiro disparo
+    camp.timezone = payload.timezone or "America/Sao_Paulo"
+
+    camp.repeat_type = payload.repeat_type
+    camp.repeat_every = int(payload.repeat_every or 0)
+    camp.repeat_weekdays = _weekdays_to_str(payload.repeat_weekdays)
+
+    camp.end_at = payload.end_at
+    camp.max_occurrences = payload.max_occurrences
+
+    # contador (não reseta)
+    camp.occurrences = int(getattr(camp, "occurrences", 0) or 0)
+
+    db.add(camp)
+    db.commit()
+    db.refresh(camp)
+
+    return get_schedule(company_id, campaign_id, db)
+
+
+@router.post("/{campaign_id}/schedule/disable", response_model=CampaignScheduleOut)
+def disable_schedule(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
+    camp.is_schedule_enabled = False
+    db.add(camp)
+    db.commit()
+    db.refresh(camp)
+    return get_schedule(company_id, campaign_id, db)
+
+
+# ======================================================
 # PREVIEW (Wizard de Campanhas - Fase C)
 # ======================================================
 
@@ -147,13 +236,6 @@ async def preview_upload_file(
     email_column: str = Query(default="email", description="Nome da coluna do e-mail (ex: email)"),
     limit: int = Query(default=5000, ge=1, le=50000, description="Máximo de linhas lidas"),
 ):
-    """
-    Lê CSV/XLSX e devolve:
-    - headers detectados
-    - amostra (primeiras 10 linhas)
-    - variáveis sugeridas (todas as colunas exceto email)
-    - contadores (total lidas, sem email)
-    """
     raw = await file.read()
     if not raw:
         raise HTTPException(status_code=400, detail="Arquivo vazio")
@@ -166,7 +248,6 @@ async def preview_upload_file(
     if not rows:
         raise HTTPException(status_code=400, detail="Nenhuma linha válida encontrada")
 
-    # headers (união das keys das primeiras linhas)
     headers_set = set()
     for r in rows[:50]:
         headers_set.update([normalize_header(k) for k in (r or {}).keys() if k])
@@ -179,7 +260,6 @@ async def preview_upload_file(
     without_email = 0
     normalized_rows: List[Dict[str, Any]] = []
     for r in rows:
-        # normaliza chaves para variáveis
         nr: Dict[str, Any] = {}
         for k, v in (r or {}).items():
             nk = _normalize_var_key(k)
@@ -187,7 +267,6 @@ async def preview_upload_file(
                 continue
             nr[nk] = (v or "").strip() if isinstance(v, str) else ("" if v is None else str(v))
 
-        # checa email (case-insensitive)
         email_val = None
         if email_col in r:
             email_val = r.get(email_col)
@@ -203,7 +282,6 @@ async def preview_upload_file(
 
         normalized_rows.append(nr)
 
-    # variáveis sugeridas: headers normalizados exceto email
     vars_suggested = sorted(
         {k for r in normalized_rows[:200] for k in r.keys()} - {email_col_l}
     )
@@ -230,16 +308,9 @@ def preview_render(
     row: Dict[str, Any] = None,
     db: Session = Depends(get_db),
 ):
-    """
-    Renderiza assunto/corpo do template combinando:
-    - context (da campanha)
-    - row (linha da planilha / payload do target)
-    Retorna subject_rendered/body_rendered e as variáveis usadas.
-    """
     tpl = _ensure_template_exists(db, company_id, template_id)
 
     ctx: Dict[str, Any] = dict(context or {})
-    # normaliza row keys para {{variavel}}
     for k, v in (row or {}).items():
         nk = _normalize_var_key(k)
         if not nk:
@@ -290,7 +361,6 @@ def get_run_stats(company_id: str, run_id: str, db: Session = Depends(get_db)):
 
     stats = _recalc_run_stats(db, str(run.id))
 
-    # persiste no totals (bom pro dashboard)
     run.totals = {
         "total": stats["total"],
         "sent": stats["sent"],
@@ -512,11 +582,6 @@ async def upload_targets_file(
     limit: int = Query(default=5000, ge=1, le=50000, description="Máximo de linhas lidas"),
     db: Session = Depends(get_db),
 ):
-    """
-    Upload CSV/XLSX:
-    - A coluna `email_column` vira destination (CampaignTarget.email)
-    - As demais colunas viram `payload` (variáveis do template: {{coluna}})
-    """
     camp = _ensure_campaign_company(db, company_id, campaign_id)
 
     raw = await file.read()
@@ -550,7 +615,6 @@ async def upload_targets_file(
     errors: List[str] = []
 
     for idx, row in enumerate(rows, start=1):
-        # email case-insensitive
         email_val = None
         if email_col in row:
             email_val = row.get(email_col)
@@ -578,7 +642,6 @@ async def upload_targets_file(
             if kl == email_col.strip().lower():
                 continue
 
-            # coluna de nome -> payload["nome"]
             if name_col and kl == name_col.strip().lower():
                 payload.setdefault("nome", (v or "").strip() if isinstance(v, str) else ("" if v is None else str(v)))
                 continue

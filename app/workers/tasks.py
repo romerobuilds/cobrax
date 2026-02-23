@@ -93,15 +93,17 @@ def _recompute_run_totals(db, run_id: str):
 
     # ✅ finaliza automaticamente quando não tiver pendentes
     if run.status in ("running", "paused") and pending_like == 0:
-        # se já estiver cancelado no nível do run, respeita
         if run.status != "cancelled":
             run.status = "finished"
         run.finished_at = datetime.now(timezone.utc)
 
         camp = db.query(Campaign).filter(Campaign.id == run.campaign_id).first()
         if camp and camp.status not in ("cancelled",):
-            # mantém seu padrão existente
-            camp.status = "done"
+            # ✅ SE FOR RECORRENTE/AGENDADA: volta pra scheduled
+            if bool(getattr(camp, "is_schedule_enabled", False)) and getattr(camp, "next_run_at", None) is not None:
+                camp.status = "scheduled"
+            else:
+                camp.status = "done"
 
     db.commit()
 
@@ -223,7 +225,6 @@ def send_email_job(self, log_id: str):
 
         ok = throttle_company(str(company.id), rate_per_min, spin_seconds=8.0)
         if not ok:
-            # não liberou dentro do spin -> reenqueue rápido
             raise self.retry(countdown=3)
 
         # ✅ marca tentativa
@@ -283,11 +284,9 @@ def send_email_job(self, log_id: str):
         _safe_update_totals_after_status_change(db, log)
 
     except Retry:
-        # ✅ self.retry() NÃO é erro: não sobrescrever status (DEFERRED etc)
         raise
 
     except Exception as e:
-        # ⚠️ Se estiver cancelado, não marca nada
         try:
             log2 = db.query(EmailLog).filter(EmailLog.id == log_id).first()
             if log2:

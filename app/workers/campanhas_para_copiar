@@ -1,0 +1,1169 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { api } from "../services/api";
+
+// -------------------------
+// Utils
+// -------------------------
+function safeJsonParse(str) {
+  try {
+    const v = JSON.parse(str);
+    return v && typeof v === "object" ? v : {};
+  } catch {
+    return null;
+  }
+}
+
+function parseApiError(e, prefix = "Erro") {
+  const status = e?.response?.status;
+  const data = e?.response?.data;
+
+  const detail =
+    typeof data === "string"
+      ? data
+      : data?.detail
+      ? JSON.stringify(data.detail)
+      : data
+      ? JSON.stringify(data)
+      : "";
+
+  return `${prefix}${status ? ` (HTTP ${status})` : ""}: ${
+    detail || e?.message || "erro desconhecido"
+  }`;
+}
+
+function Badge({ kind, children }) {
+  const map = {
+    sent: { bg: "rgba(46, 204, 113, .18)", bd: "rgba(46, 204, 113, .35)" },
+    pending: { bg: "rgba(241, 196, 15, .18)", bd: "rgba(241, 196, 15, .35)" },
+    failed: { bg: "rgba(255, 77, 77, .18)", bd: "rgba(255, 77, 77, .35)" },
+    neutral: { bg: "rgba(255,255,255,.06)", bd: "rgba(255,255,255,.10)" },
+  };
+  const s = map[kind] || map.neutral;
+
+  return (
+    <span
+      style={{
+        padding: "4px 10px",
+        borderRadius: 999,
+        border: `1px solid ${s.bd}`,
+        background: s.bg,
+        fontSize: 12,
+        fontWeight: 900,
+        whiteSpace: "nowrap",
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
+// tenta normalizar o formato de stats, sem depender do shape exato do backend
+function normalizeStats(raw) {
+  const r = raw && typeof raw === "object" ? raw : {};
+  const by =
+    (r.by_status && typeof r.by_status === "object" ? r.by_status : {}) || {};
+
+  const sent = Number(by.SENT ?? by.sent ?? r.sent ?? 0) || 0;
+  const failed = Number(by.FAILED ?? by.failed ?? r.failed ?? 0) || 0;
+
+  const pendingGuess =
+    Number(by.PENDING ?? by.pending ?? 0) +
+    Number(by.QUEUED ?? by.queued ?? 0) +
+    Number(by.RUNNING ?? by.running ?? 0);
+
+  const pending = Number(r.pending ?? pendingGuess ?? 0) || 0;
+
+  const total =
+    Number(r.total ?? r.total_targets ?? r.targets_total ?? r.count ?? 0) || 0;
+
+  return {
+    sent,
+    pending,
+    failed,
+    total,
+    by_status: by,
+    campaign_status: r.campaign_status ?? r.status ?? null,
+    updated_at: r.updated_at ?? null,
+  };
+}
+
+function isFinalStatus(s) {
+  const v = String(s || "").toLowerCase();
+  return ["done", "completed", "finished", "failed", "canceled", "cancelled"].includes(
+    v
+  );
+}
+
+function isPausedStatus(s) {
+  const v = String(s || "").toLowerCase();
+  return ["paused", "pause"].includes(v);
+}
+
+function toISOFromDatetimeLocal(value) {
+  // value: "YYYY-MM-DDTHH:mm"
+  // new Date(value) assume LOCAL time and convert to ISO (UTC 'Z')
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
+function toDatetimeLocalFromISO(iso) {
+  // converte ISO -> "YYYY-MM-DDTHH:mm" no horário local
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  const mm = pad(d.getMonth() + 1);
+  const dd = pad(d.getDate());
+  const hh = pad(d.getHours());
+  const mi = pad(d.getMinutes());
+  return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
+}
+
+// -------------------------
+// Component
+// -------------------------
+export default function Campanhas({ selectedCompanyId }) {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  const [templates, setTemplates] = useState([]);
+  const [clientes, setClientes] = useState([]);
+
+  const [campaigns, setCampaigns] = useState([]);
+  const [openId, setOpenId] = useState(null);
+
+  // form
+  const [nome, setNome] = useState("");
+  const [templateId, setTemplateId] = useState("");
+  const [ratePerMin, setRatePerMin] = useState(15);
+  const [mode, setMode] = useState("selected"); // selected | all | upload
+  const [selectedClientIds, setSelectedClientIds] = useState([]);
+
+  // upload (targets)
+  const [uploadFile, setUploadFile] = useState(null);
+  const [emailColumn, setEmailColumn] = useState("email");
+  const [nameColumn, setNameColumn] = useState("nome");
+  const [limit, setLimit] = useState(5000);
+
+  // context base
+  const [contextText, setContextText] = useState(
+    JSON.stringify(
+      {
+        valor: "R$ 99,00",
+        vencimento: "11/03/2026",
+        link_pagamento: "https://pagamentos.exemplo.com/fatura/123",
+      },
+      null,
+      2
+    )
+  );
+
+  const [creating, setCreating] = useState(false);
+
+  // ações (pause/resume/cancel) loading por campanha
+  const [actionBusyId, setActionBusyId] = useState(null);
+
+  // -------------------------
+  // Agendamento simples (scheduled_at) na criação
+  // -------------------------
+  const [useScheduledAt, setUseScheduledAt] = useState(false);
+  const [scheduledAtLocal, setScheduledAtLocal] = useState("");
+
+  // -------------------------
+  // Agendamento avançado (repetição) do endpoint /schedule
+  // -------------------------
+  const [scheduleLoading, setScheduleLoading] = useState(false);
+  const [scheduleSaving, setScheduleSaving] = useState(false);
+
+  const [schEnabled, setSchEnabled] = useState(false);
+  const [schStartAtLocal, setSchStartAtLocal] = useState("");
+  const [schTimezone, setSchTimezone] = useState("America/Sao_Paulo");
+  const [schRepeatType, setSchRepeatType] = useState("none"); // none|days|weeks|months
+  const [schRepeatEvery, setSchRepeatEvery] = useState(1);
+  const [schWeekdays, setSchWeekdays] = useState([1, 2, 3, 4, 5]); // default seg-sex
+  const [schEndAtLocal, setSchEndAtLocal] = useState("");
+  const [schMaxOcc, setSchMaxOcc] = useState("");
+
+  const openCampaign = useMemo(
+    () => campaigns.find((c) => String(c.id) === String(openId)),
+    [campaigns, openId]
+  );
+
+  const templateOptions = useMemo(() => {
+    return templates.map((t) => ({
+      id: String(t.id),
+      nome: t.nome ?? t.name ?? "(sem nome)",
+      assunto: t.assunto ?? t.subject ?? "",
+    }));
+  }, [templates]);
+
+  const selectedTemplate = useMemo(() => {
+    return templateOptions.find((t) => String(t.id) === String(templateId));
+  }, [templateOptions, templateId]);
+
+  function toggleClient(id) {
+    setSelectedClientIds((prev) => {
+      const sid = String(id);
+      const has = prev.some((x) => String(x) === sid);
+      return has ? prev.filter((x) => String(x) !== sid) : [...prev, id];
+    });
+  }
+
+  function selectAllList() {
+    setSelectedClientIds(clientes.map((c) => c.id));
+  }
+
+  function clearSelection() {
+    setSelectedClientIds([]);
+  }
+
+  // -------------------------
+  // Load base
+  // -------------------------
+  async function loadBase() {
+    if (!selectedCompanyId) return;
+
+    try {
+      setLoading(true);
+      setError("");
+
+      const rt = await api.get(`/empresas/${selectedCompanyId}/templates/`);
+      const listT = Array.isArray(rt.data) ? rt.data : [];
+      setTemplates(listT);
+
+      const rc = await api.get(`/empresas/${selectedCompanyId}/clientes/`);
+      const listC = Array.isArray(rc.data) ? rc.data : [];
+      setClientes(listC);
+
+      const rcamp = await api.get(`/empresas/${selectedCompanyId}/campanhas/`);
+      setCampaigns(Array.isArray(rcamp.data) ? rcamp.data : []);
+
+      if (!templateId && listT[0]?.id) setTemplateId(String(listT[0].id));
+    } catch (e) {
+      setError(parseApiError(e, "Falha ao carregar dados"));
+      setTemplates([]);
+      setClientes([]);
+      setCampaigns([]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (selectedCompanyId) loadBase();
+    else {
+      setTemplates([]);
+      setClientes([]);
+      setCampaigns([]);
+      setLoading(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedCompanyId]);
+
+  // -------------------------
+  // Stats polling
+  // -------------------------
+  async function refreshCampaignStats(camp) {
+    if (!camp || !selectedCompanyId) return;
+
+    try {
+      const r = await api.get(
+        `/empresas/${selectedCompanyId}/campanhas/${camp.id}/stats`
+      );
+
+      const norm = normalizeStats(r.data);
+
+      setCampaigns((prev) =>
+        prev.map((c) =>
+          String(c.id) === String(camp.id) ? { ...c, _stats: norm } : c
+        )
+      );
+    } catch (e) {
+      setError(parseApiError(e, "Falha ao atualizar stats da campanha"));
+    }
+  }
+
+  const pollRef = useRef(null);
+  useEffect(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+
+    if (!openCampaign || !selectedCompanyId) return;
+
+    refreshCampaignStats(openCampaign);
+
+    pollRef.current = setInterval(() => {
+      refreshCampaignStats(openCampaign);
+    }, 3000);
+
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+      pollRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openId, selectedCompanyId]);
+
+  // -------------------------
+  // Schedule: load on open
+  // -------------------------
+  async function loadSchedule(camp) {
+    if (!camp || !selectedCompanyId) return;
+    setScheduleLoading(true);
+    try {
+      setError("");
+      const r = await api.get(
+        `/empresas/${selectedCompanyId}/campanhas/${camp.id}/schedule`
+      );
+
+      // esperado: CampaignScheduleOut
+      const s = r.data || {};
+      setSchEnabled(Boolean(s.is_schedule_enabled));
+      setSchTimezone(s.timezone || "America/Sao_Paulo");
+      setSchStartAtLocal(toDatetimeLocalFromISO(s.start_at));
+      setSchEndAtLocal(toDatetimeLocalFromISO(s.end_at));
+      setSchRepeatType(s.repeat_type || "none");
+      setSchRepeatEvery(Number(s.repeat_every || 1) || 1);
+      setSchWeekdays(Array.isArray(s.repeat_weekdays) ? s.repeat_weekdays : [1,2,3,4,5]);
+      setSchMaxOcc(
+        s.max_occurrences === null || s.max_occurrences === undefined ? "" : String(s.max_occurrences)
+      );
+    } catch (e) {
+      // se ainda não existe schedule no backend, ele pode retornar 404/500
+      setError(parseApiError(e, "Falha ao carregar agendamento"));
+    } finally {
+      setScheduleLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (openCampaign && selectedCompanyId) {
+      loadSchedule(openCampaign);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openId, selectedCompanyId]);
+
+  function toggleWeekday(d) {
+    setSchWeekdays((prev) => {
+      const has = prev.includes(d);
+      const next = has ? prev.filter((x) => x !== d) : [...prev, d];
+      return next.sort((a, b) => a - b);
+    });
+  }
+
+  async function saveSchedule() {
+    if (!openCampaign || !selectedCompanyId) return;
+
+    // validações mínimas
+    if (schEnabled) {
+      if (!schStartAtLocal) {
+        return setError("Escolha o Start (data/hora) do agendamento.");
+      }
+      if (schRepeatType !== "none" && (!schRepeatEvery || Number(schRepeatEvery) <= 0)) {
+        return setError("repeat_every precisa ser > 0 quando repetir.");
+      }
+      if (schRepeatType === "weeks" && (!schWeekdays || schWeekdays.length === 0)) {
+        return setError("Selecione pelo menos 1 dia da semana para repetição semanal.");
+      }
+    }
+
+    const payload = {
+      is_enabled: Boolean(schEnabled),
+      start_at: schEnabled ? toISOFromDatetimeLocal(schStartAtLocal) : null,
+      timezone: schTimezone || "America/Sao_Paulo",
+      repeat_type: schRepeatType || "none",
+      repeat_every: schRepeatType === "none" ? 0 : Number(schRepeatEvery || 1),
+      repeat_weekdays: schRepeatType === "weeks" ? schWeekdays : null,
+      end_at: schEndAtLocal ? toISOFromDatetimeLocal(schEndAtLocal) : null,
+      max_occurrences: schMaxOcc === "" ? null : Number(schMaxOcc),
+    };
+
+    try {
+      setScheduleSaving(true);
+      setError("");
+      await api.post(
+        `/empresas/${selectedCompanyId}/campanhas/${openCampaign.id}/schedule`,
+        payload
+      );
+      await loadBase();
+      await refreshCampaignStats(openCampaign);
+      await loadSchedule(openCampaign);
+    } catch (e) {
+      setError(parseApiError(e, "Falha ao salvar agendamento"));
+    } finally {
+      setScheduleSaving(false);
+    }
+  }
+
+  async function disableSchedule() {
+    if (!openCampaign || !selectedCompanyId) return;
+    try {
+      setScheduleSaving(true);
+      setError("");
+      await api.post(
+        `/empresas/${selectedCompanyId}/campanhas/${openCampaign.id}/schedule/disable`
+      );
+      setSchEnabled(false);
+      await loadBase();
+      await loadSchedule(openCampaign);
+    } catch (e) {
+      setError(parseApiError(e, "Falha ao desabilitar agendamento"));
+    } finally {
+      setScheduleSaving(false);
+    }
+  }
+
+  // -------------------------
+  // Controls: pause/resume/cancel
+  // -------------------------
+  async function controlCampaign(camp, action) {
+    if (!camp || !selectedCompanyId) return;
+
+    try {
+      setError("");
+      setActionBusyId(String(camp.id));
+
+      if (action === "pause") {
+        await api.post(`/empresas/${selectedCompanyId}/campanhas/${camp.id}/pause`);
+      } else if (action === "resume") {
+        await api.post(`/empresas/${selectedCompanyId}/campanhas/${camp.id}/resume`);
+      } else if (action === "cancel") {
+        const ok = window.confirm(
+          `Cancelar a campanha "${camp.name}"? Isso deve parar os envios do run atual.`
+        );
+        if (!ok) return;
+        await api.post(`/empresas/${selectedCompanyId}/campanhas/${camp.id}/cancel`);
+      } else {
+        throw new Error("Ação inválida");
+      }
+
+      await loadBase();
+      await refreshCampaignStats(camp);
+    } catch (e) {
+      setError(parseApiError(e, "Falha ao executar ação na campanha"));
+    } finally {
+      setActionBusyId(null);
+    }
+  }
+
+  // -------------------------
+  // Create: immediate OR scheduled_at
+  // -------------------------
+  async function createCampaignAndStart(e) {
+    e.preventDefault();
+    if (!selectedCompanyId) return;
+
+    setError("");
+
+    const n = (nome || "").trim();
+    if (!n) return setError("Dê um nome para a campanha.");
+    if (!templateId) return setError("Selecione um template.");
+
+    const parsed = safeJsonParse(contextText);
+    if (!parsed) {
+      return setError('Context (JSON) inválido. Exemplo: {"valor":"R$ 99,00"}');
+    }
+
+    if (mode === "selected" && selectedClientIds.length === 0) {
+      return setError("Selecione pelo menos 1 cliente (ou mude para 'Todos').");
+    }
+
+    if (mode === "upload" && !uploadFile) {
+      return setError("Selecione um arquivo CSV/XLSX para o upload.");
+    }
+
+    // scheduled_at
+    let scheduled_at = null;
+    if (useScheduledAt) {
+      if (!scheduledAtLocal) return setError("Selecione a data/hora do agendamento.");
+      scheduled_at = toISOFromDatetimeLocal(scheduledAtLocal);
+      if (!scheduled_at) return setError("Data/hora do agendamento inválida.");
+    }
+
+    try {
+      setCreating(true);
+
+      // 1) cria campanha
+      const rCreate = await api.post(`/empresas/${selectedCompanyId}/campanhas/`, {
+        name: n,
+        template_id: templateId,
+        mode,
+        context: parsed,
+        rate_per_min: Number(ratePerMin) || 15,
+        scheduled_at, // ✅ se null: comportamento normal
+      });
+
+      const camp = rCreate.data;
+      const campaignId = camp?.id;
+      if (!campaignId) throw new Error("Campaign não retornou ID");
+
+      // 2) adiciona targets
+      if (mode === "all") {
+        await api.post(
+          `/empresas/${selectedCompanyId}/campanhas/${campaignId}/targets/all`
+        );
+      } else if (mode === "selected") {
+        await api.post(
+          `/empresas/${selectedCompanyId}/campanhas/${campaignId}/targets/selected`,
+          { client_ids: selectedClientIds, payload: {} }
+        );
+      } else if (mode === "upload") {
+        const fd = new FormData();
+        fd.append("file", uploadFile);
+
+        const params = new URLSearchParams();
+        params.set("email_column", (emailColumn || "email").trim());
+        params.set("name_column", (nameColumn || "nome").trim());
+        params.set("limit", String(Number(limit) || 5000));
+
+        await api.post(
+          `/empresas/${selectedCompanyId}/campanhas/${campaignId}/targets/upload?${params.toString()}`,
+          fd,
+          { headers: { "Content-Type": "multipart/form-data" } }
+        );
+      }
+
+      // 3) se NÃO for agendado, start run imediatamente
+      if (!scheduled_at) {
+        await api.post(`/empresas/${selectedCompanyId}/campanhas/${campaignId}/run`);
+      }
+
+      await loadBase();
+      setOpenId(String(campaignId));
+
+      // reset do form
+      setNome("");
+      setMode("selected");
+      setSelectedClientIds([]);
+      setUploadFile(null);
+      setUseScheduledAt(false);
+      setScheduledAtLocal("");
+    } catch (err) {
+      setError(parseApiError(err, "Falha ao criar/disparar campanha"));
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  // -------------------------
+  // Render
+  // -------------------------
+  if (!selectedCompanyId) {
+    return (
+      <div style={card}>
+        <h2 style={{ margin: 0, marginBottom: 10 }}>Campanhas</h2>
+        <div style={{ opacity: 0.85 }}>
+          Selecione uma empresa em <b>Empresas</b> para gerenciar campanhas.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: "grid", gap: 16 }}>
+      <div style={card}>
+        <h2 style={{ margin: 0, marginBottom: 12 }}>Campanhas</h2>
+
+        {error && <div style={{ color: "#ff6b6b", marginBottom: 12 }}>{error}</div>}
+
+        {loading ? (
+          <div>Carregando...</div>
+        ) : (
+          <form onSubmit={createCampaignAndStart} style={{ display: "grid", gap: 10 }}>
+            <input
+              value={nome}
+              onChange={(e) => setNome(e.target.value)}
+              placeholder="Nome da campanha (ex: Cobrança Março/2026)"
+              style={inputStyle}
+            />
+
+            <select value={templateId} onChange={(e) => setTemplateId(e.target.value)} style={inputStyle}>
+              <option value="">Selecione um template…</option>
+              {templateOptions.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.nome} {t.assunto ? `— ${t.assunto}` : ""} ({t.id})
+                </option>
+              ))}
+            </select>
+
+            {selectedTemplate && (
+              <div style={{ fontSize: 12, opacity: 0.75 }}>
+                Variáveis típicas: <b>{"{{nome}}"}</b>, <b>{"{{email}}"}</b>, <b>{"{{valor}}"}</b>,{" "}
+                <b>{"{{vencimento}}"}</b>, <b>{"{{link_pagamento}}"}</b>…
+              </div>
+            )}
+
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <label style={pill}>
+                <input
+                  type="radio"
+                  name="mode"
+                  checked={mode === "selected"}
+                  onChange={() => setMode("selected")}
+                />{" "}
+                Selecionados
+              </label>
+
+              <label style={pill}>
+                <input type="radio" name="mode" checked={mode === "all"} onChange={() => setMode("all")} />{" "}
+                Todos
+              </label>
+
+              <label style={pill}>
+                <input
+                  type="radio"
+                  name="mode"
+                  checked={mode === "upload"}
+                  onChange={() => setMode("upload")}
+                />{" "}
+                Upload (planilha)
+              </label>
+
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontSize: 12, opacity: 0.8 }}>rate_per_min</span>
+                <input
+                  value={ratePerMin}
+                  onChange={(e) => setRatePerMin(e.target.value)}
+                  style={{ ...inputStyle, width: 120 }}
+                />
+              </div>
+            </div>
+
+            {/* scheduled_at simples */}
+            <div style={{ ...box, display: "grid", gap: 10 }}>
+              <div style={{ fontWeight: 900 }}>Agendar (scheduled_at)</div>
+
+              <label style={{ display: "flex", gap: 10, alignItems: "center", userSelect: "none" }}>
+                <input
+                  type="checkbox"
+                  checked={useScheduledAt}
+                  onChange={(e) => setUseScheduledAt(e.target.checked)}
+                />
+                <span style={{ fontWeight: 800, opacity: 0.9 }}>
+                  Criar campanha agendada (não dispara agora)
+                </span>
+              </label>
+
+              {useScheduledAt && (
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>Data/hora:</div>
+                  <input
+                    type="datetime-local"
+                    value={scheduledAtLocal}
+                    onChange={(e) => setScheduledAtLocal(e.target.value)}
+                    style={{ ...inputStyle, width: 260 }}
+                  />
+                  <div style={{ fontSize: 12, opacity: 0.65 }}>
+                    (salvo em UTC no backend)
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {mode === "selected" && (
+              <div style={box}>
+                <div style={{ fontWeight: 900, marginBottom: 10 }}>Público (clientes)</div>
+
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  <button type="button" onClick={selectAllList} style={secondaryBtn}>
+                    Selecionar todos (lista)
+                  </button>
+                  <button type="button" onClick={clearSelection} style={secondaryBtn}>
+                    Limpar seleção
+                  </button>
+                  <div style={{ fontSize: 12, opacity: 0.75, alignSelf: "center" }}>
+                    Selecionados: <b>{selectedClientIds.length}</b>
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    marginTop: 10,
+                    display: "grid",
+                    gap: 8,
+                    maxHeight: 260,
+                    overflow: "auto",
+                    paddingRight: 6,
+                  }}
+                >
+                  {clientes.map((c) => {
+                    const checked = selectedClientIds.some((x) => String(x) === String(c.id));
+                    return (
+                      <label
+                        key={c.id}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 10,
+                          userSelect: "none",
+                          opacity: 0.95,
+                          padding: 8,
+                          borderRadius: 10,
+                          border: "1px solid rgba(255,255,255,.06)",
+                          background: checked ? "rgba(46, 204, 113, .10)" : "transparent",
+                        }}
+                      >
+                        <input type="checkbox" checked={checked} onChange={() => toggleClient(c.id)} />
+                        <span style={{ minWidth: 0 }}>
+                          <b>{c.nome}</b>{" "}
+                          <span style={{ opacity: 0.75 }}>• {c.email || "-"}</span>
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {mode === "upload" && (
+              <div style={box}>
+                <div style={{ fontWeight: 900, marginBottom: 10 }}>Upload de targets (CSV/XLSX)</div>
+
+                <input
+                  type="file"
+                  accept=".csv,.xlsx"
+                  onChange={(e) => setUploadFile(e.target.files?.[0] || null)}
+                  style={inputStyle}
+                />
+
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  <input
+                    value={emailColumn}
+                    onChange={(e) => setEmailColumn(e.target.value)}
+                    placeholder="email_column (ex: email)"
+                    style={{ ...inputStyle, width: 220 }}
+                  />
+                  <input
+                    value={nameColumn}
+                    onChange={(e) => setNameColumn(e.target.value)}
+                    placeholder="name_column (ex: nome)"
+                    style={{ ...inputStyle, width: 220 }}
+                  />
+                  <input
+                    value={limit}
+                    onChange={(e) => setLimit(e.target.value)}
+                    placeholder="limit"
+                    style={{ ...inputStyle, width: 140 }}
+                  />
+                </div>
+
+                <div style={{ fontSize: 12, opacity: 0.7 }}>
+                  As colunas (exceto email) viram variáveis do template via <b>{"{{coluna}}"}</b>.
+                </div>
+              </div>
+            )}
+
+            <div style={{ display: "grid", gap: 8 }}>
+              <div style={{ fontWeight: 900 }}>Context (JSON) — variáveis do template</div>
+
+              <textarea
+                value={contextText}
+                onChange={(e) => setContextText(e.target.value)}
+                rows={8}
+                style={{ ...inputStyle, resize: "vertical" }}
+                placeholder='Ex: {"valor":"R$ 99,00","vencimento":"11/03/2026"}'
+              />
+
+              <div style={{ fontSize: 12, opacity: 0.7 }}>
+                Isso entra como “base”. No upload, cada linha pode sobrescrever/adicionar payload.
+              </div>
+            </div>
+
+            <button
+              type="submit"
+              disabled={creating}
+              style={{
+                ...primaryBtn,
+                background: creating ? "#2b2f36" : "#2ecc71",
+                cursor: creating ? "not-allowed" : "pointer",
+              }}
+            >
+              {creating
+                ? "Salvando..."
+                : useScheduledAt
+                ? "Criar campanha agendada"
+                : "Criar e disparar campanha"}
+            </button>
+          </form>
+        )}
+      </div>
+
+      <div style={card}>
+        <h3 style={{ margin: 0, marginBottom: 12 }}>Minhas campanhas</h3>
+
+        {campaigns.length === 0 ? (
+          <div style={{ opacity: 0.8 }}>Nenhuma campanha criada ainda.</div>
+        ) : (
+          <div style={{ display: "grid", gap: 10 }}>
+            {campaigns.map((c) => {
+              const isOpen = String(c.id) === String(openId);
+              const tpl = templateOptions.find((t) => String(t.id) === String(c.template_id));
+              const stats = normalizeStats(c._stats || {});
+              const busy = String(actionBusyId || "") === String(c.id);
+
+              const statusLabel = c.status ?? stats.campaign_status ?? "-";
+              const statusLower = String(statusLabel || "").toLowerCase();
+
+              const final = isFinalStatus(statusLower);
+              const paused = isPausedStatus(statusLower);
+
+              return (
+                <div
+                  key={c.id}
+                  style={{
+                    border: "1px solid rgba(255,255,255,.08)",
+                    borderRadius: 12,
+                    padding: 12,
+                    background: isOpen ? "rgba(52, 152, 219, .10)" : "#0b0d10",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "flex-start",
+                      gap: 12,
+                    }}
+                  >
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontWeight: 900 }}>{c.name}</div>
+                      <div style={{ fontSize: 12, opacity: 0.8 }}>
+                        Template: {tpl?.nome || c.template_id} • Status: <b>{statusLabel}</b> • Modo:{" "}
+                        <b>{c.mode}</b>
+                      </div>
+
+                      <div
+                        style={{
+                          marginTop: 10,
+                          display: "flex",
+                          gap: 8,
+                          flexWrap: "wrap",
+                          alignItems: "center",
+                        }}
+                      >
+                        <Badge kind="sent">SENT: {stats.sent}</Badge>
+                        <Badge kind="pending">PENDING: {stats.pending}</Badge>
+                        <Badge kind="failed">FAILED: {stats.failed}</Badge>
+                        <Badge kind="neutral">TOTAL: {stats.total}</Badge>
+                      </div>
+
+                      {isOpen && (
+                        <div style={{ marginTop: 8, fontSize: 12, opacity: 0.65 }}>
+                          Auto-refresh: a cada 3s enquanto estiver aberto.
+                        </div>
+                      )}
+                    </div>
+
+                    <div style={{ display: "grid", gap: 8, justifyItems: "end" }}>
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setOpenId(isOpen ? null : c.id);
+                            if (!isOpen) refreshCampaignStats(c);
+                          }}
+                          style={secondaryBtn}
+                        >
+                          {isOpen ? "Fechar" : "Abrir"}
+                        </button>
+
+                        <button type="button" onClick={() => refreshCampaignStats(c)} style={secondaryBtn}>
+                          Atualizar stats
+                        </button>
+                      </div>
+
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                        {!final && !paused && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => controlCampaign(c, "pause")}
+                            style={{
+                              ...secondaryBtn,
+                              opacity: busy ? 0.6 : 1,
+                              cursor: busy ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            {busy ? "..." : "Pausar"}
+                          </button>
+                        )}
+
+                        {!final && paused && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => controlCampaign(c, "resume")}
+                            style={{
+                              ...secondaryBtn,
+                              opacity: busy ? 0.6 : 1,
+                              cursor: busy ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            {busy ? "..." : "Continuar"}
+                          </button>
+                        )}
+
+                        {!final && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => controlCampaign(c, "cancel")}
+                            style={{
+                              ...secondaryBtn,
+                              border: "1px solid rgba(255, 77, 77, .35)",
+                              background: "rgba(255, 77, 77, .10)",
+                              opacity: busy ? 0.6 : 1,
+                              cursor: busy ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            {busy ? "..." : "Cancelar"}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {isOpen && (
+                    <div style={{ marginTop: 12, display: "grid", gap: 12 }}>
+                      <div style={{ fontWeight: 900 }}>Context (JSON)</div>
+                      <pre style={preBox}>{JSON.stringify(c.context || {}, null, 2)}</pre>
+
+                      {/* Painel schedule */}
+                      <div style={{ ...box, display: "grid", gap: 10 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                          <div style={{ fontWeight: 900 }}>Agendamento & repetição</div>
+                          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                            <button
+                              type="button"
+                              onClick={() => loadSchedule(c)}
+                              style={secondaryBtn}
+                              disabled={scheduleLoading || scheduleSaving}
+                            >
+                              {scheduleLoading ? "Carregando..." : "Recarregar"}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={disableSchedule}
+                              style={{
+                                ...secondaryBtn,
+                                border: "1px solid rgba(255, 77, 77, .35)",
+                                background: "rgba(255, 77, 77, .10)",
+                              }}
+                              disabled={scheduleSaving}
+                            >
+                              Desabilitar
+                            </button>
+                          </div>
+                        </div>
+
+                        <label style={{ display: "flex", gap: 10, alignItems: "center", userSelect: "none" }}>
+                          <input
+                            type="checkbox"
+                            checked={schEnabled}
+                            onChange={(e) => setSchEnabled(e.target.checked)}
+                          />
+                          <span style={{ fontWeight: 800, opacity: 0.9 }}>Habilitar agendamento</span>
+                        </label>
+
+                        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                          <div style={{ fontSize: 12, opacity: 0.8 }}>Start:</div>
+                          <input
+                            type="datetime-local"
+                            value={schStartAtLocal}
+                            onChange={(e) => setSchStartAtLocal(e.target.value)}
+                            style={{ ...inputStyle, width: 260 }}
+                            disabled={!schEnabled}
+                          />
+
+                          <div style={{ fontSize: 12, opacity: 0.8 }}>Timezone:</div>
+                          <input
+                            value={schTimezone}
+                            onChange={(e) => setSchTimezone(e.target.value)}
+                            style={{ ...inputStyle, width: 220 }}
+                            disabled={!schEnabled}
+                            placeholder="America/Sao_Paulo"
+                          />
+                        </div>
+
+                        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                          <div style={{ fontSize: 12, opacity: 0.8 }}>Repetir:</div>
+                          <select
+                            value={schRepeatType}
+                            onChange={(e) => setSchRepeatType(e.target.value)}
+                            style={{ ...inputStyle, width: 200 }}
+                            disabled={!schEnabled}
+                          >
+                            <option value="none">Não repetir</option>
+                            <option value="days">A cada X dias</option>
+                            <option value="weeks">A cada X semanas</option>
+                            <option value="months">A cada X meses</option>
+                          </select>
+
+                          <div style={{ fontSize: 12, opacity: 0.8 }}>a cada</div>
+                          <input
+                            value={schRepeatEvery}
+                            onChange={(e) => setSchRepeatEvery(e.target.value)}
+                            style={{ ...inputStyle, width: 90 }}
+                            disabled={!schEnabled || schRepeatType === "none"}
+                          />
+                        </div>
+
+                        {schRepeatType === "weeks" && (
+                          <div style={{ display: "grid", gap: 8 }}>
+                            <div style={{ fontSize: 12, opacity: 0.8 }}>
+                              Dias da semana (0=Dom, 6=Sáb)
+                            </div>
+                            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                              {[
+                                { d: 0, label: "Dom" },
+                                { d: 1, label: "Seg" },
+                                { d: 2, label: "Ter" },
+                                { d: 3, label: "Qua" },
+                                { d: 4, label: "Qui" },
+                                { d: 5, label: "Sex" },
+                                { d: 6, label: "Sáb" },
+                              ].map((it) => {
+                                const active = schWeekdays.includes(it.d);
+                                return (
+                                  <button
+                                    key={it.d}
+                                    type="button"
+                                    onClick={() => toggleWeekday(it.d)}
+                                    disabled={!schEnabled}
+                                    style={{
+                                      ...secondaryBtn,
+                                      background: active ? "rgba(46, 204, 113, .12)" : "#15181d",
+                                      border: active
+                                        ? "1px solid rgba(46, 204, 113, .35)"
+                                        : "1px solid rgba(255,255,255,.10)",
+                                    }}
+                                  >
+                                    {it.label}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+
+                        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                          <div style={{ fontSize: 12, opacity: 0.8 }}>End (opcional):</div>
+                          <input
+                            type="datetime-local"
+                            value={schEndAtLocal}
+                            onChange={(e) => setSchEndAtLocal(e.target.value)}
+                            style={{ ...inputStyle, width: 260 }}
+                            disabled={!schEnabled}
+                          />
+
+                          <div style={{ fontSize: 12, opacity: 0.8 }}>Max ocorrências (opcional):</div>
+                          <input
+                            value={schMaxOcc}
+                            onChange={(e) => setSchMaxOcc(e.target.value)}
+                            style={{ ...inputStyle, width: 160 }}
+                            disabled={!schEnabled}
+                            placeholder="ex: 10"
+                          />
+                        </div>
+
+                        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                          <button
+                            type="button"
+                            onClick={saveSchedule}
+                            style={{
+                              ...primaryBtn,
+                              background: scheduleSaving ? "#2b2f36" : "#2ecc71",
+                              cursor: scheduleSaving ? "not-allowed" : "pointer",
+                            }}
+                            disabled={scheduleSaving}
+                          >
+                            {scheduleSaving ? "Salvando..." : "Salvar agendamento"}
+                          </button>
+
+                          <div style={{ fontSize: 12, opacity: 0.7, alignSelf: "center" }}>
+                            Dica: para teste rápido, coloque Start em +2min e repeat_type=none.
+                          </div>
+                        </div>
+                      </div>
+
+                      <div style={{ fontSize: 12, opacity: 0.65 }}>ID: {c.id}</div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// -------------------------
+// Styles
+// -------------------------
+const card = {
+  background: "#0f1114",
+  border: "1px solid rgba(255,255,255,.06)",
+  borderRadius: 12,
+  padding: 16,
+};
+
+const box = {
+  padding: 12,
+  borderRadius: 12,
+  border: "1px solid rgba(255,255,255,.06)",
+  background: "#0b0d10",
+};
+
+const preBox = {
+  margin: 0,
+  background: "#0f1114",
+  border: "1px solid rgba(255,255,255,.06)",
+  borderRadius: 12,
+  padding: 12,
+  overflow: "auto",
+};
+
+const inputStyle = {
+  padding: "10px 12px",
+  borderRadius: 10,
+  border: "1px solid rgba(255,255,255,.10)",
+  background: "#0b0d10",
+  color: "#fff",
+  outline: "none",
+};
+
+const primaryBtn = {
+  padding: "12px 14px",
+  borderRadius: 12,
+  border: "none",
+  color: "#0b0d10",
+  fontWeight: 900,
+};
+
+const secondaryBtn = {
+  padding: "10px 12px",
+  borderRadius: 10,
+  border: "1px solid rgba(255,255,255,.10)",
+  background: "#15181d",
+  color: "#fff",
+  fontWeight: 800,
+  cursor: "pointer",
+  whiteSpace: "nowrap",
+};
+
+const pill = {
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  padding: "10px 12px",
+  borderRadius: 999,
+  border: "1px solid rgba(255,255,255,.10)",
+  background: "#15181d",
+  fontWeight: 800,
+};

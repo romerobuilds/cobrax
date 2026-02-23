@@ -1,11 +1,11 @@
+# app/workers/scheduler.py
 from __future__ import annotations
 
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
-from sqlalchemy import func
 
 from app.database_.database import SessionLocal
 
@@ -44,6 +44,11 @@ def _render_placeholders(text: str, ctx: Dict[str, Any]) -> str:
 
 
 def _compute_next_run(c: Campaign, base_utc: datetime) -> datetime | None:
+    """
+    base_utc = referência para calcular o próximo (ideal: o "fire time" anterior)
+    repeat_type suportados: none | minutes | hours | days | weeks
+    repeat_weekdays: "0,1,2" usando Python weekday (0=Mon .. 6=Sun) quando weeks
+    """
     rt = (getattr(c, "repeat_type", None) or "none").lower()
     every = int(getattr(c, "repeat_every", 0) or 0)
 
@@ -57,7 +62,6 @@ def _compute_next_run(c: Campaign, base_utc: datetime) -> datetime | None:
     if rt == "days":
         return base_utc + timedelta(days=every)
     if rt == "weeks":
-        # weekdays "0,1,2..." (seg=0..dom=6)
         raw = getattr(c, "repeat_weekdays", None)
         weekdays: list[int] = []
         if raw:
@@ -67,10 +71,11 @@ def _compute_next_run(c: Campaign, base_utc: datetime) -> datetime | None:
                 weekdays = []
         weekdays = sorted({d for d in weekdays if 0 <= d <= 6})
 
+        # se não definiu dias, cai no simples (a cada X semanas)
         if not weekdays:
             return base_utc + timedelta(weeks=every)
 
-        # procura o próximo dia permitido (até 14 dias)
+        # pega o próximo dia permitido, procurando até 14 dias
         for i in range(1, 15):
             cand = base_utc + timedelta(days=i)
             if cand.weekday() in weekdays:
@@ -101,11 +106,22 @@ def _schedule_can_fire(c: Campaign) -> bool:
     return True
 
 
+def _has_pending_logs_for_run(db: Session, run_id) -> bool:
+    pending_any = (
+        db.query(EmailLog.id)
+        .filter(EmailLog.campaign_run_id == run_id)
+        .filter(EmailLog.status.in_(PENDING_STATUSES))
+        .first()
+    )
+    return bool(pending_any)
+
+
 def _maybe_finalize_last_run(db: Session, camp: Campaign) -> None:
     """
     Se o último run estiver "running/paused" mas não houver mais logs pendentes,
-    finaliza o run e ajusta status da campanha.
-    Isso é necessário pra repetição funcionar sem um finalizador no worker.
+    finaliza o run e ajusta status da campanha:
+    - se schedule_enabled ainda ligado -> status vira "scheduled"
+    - senão -> "done"
     """
     last_run = (
         db.query(CampaignRun)
@@ -119,36 +135,61 @@ def _maybe_finalize_last_run(db: Session, camp: Campaign) -> None:
     if last_run.status not in ("running", "paused"):
         return
 
-    pending_any = (
-        db.query(EmailLog.id)
-        .filter(EmailLog.campaign_run_id == last_run.id)
-        .filter(EmailLog.status.in_(PENDING_STATUSES))
-        .first()
-    )
-    if pending_any:
+    if _has_pending_logs_for_run(db, last_run.id):
         return
 
-    # não há mais pendências -> finaliza
     last_run.status = "finished"
     last_run.finished_at = _utc_now()
 
-    # campanha: se foi cancelada manualmente, respeita
-    if camp.status not in ("cancelled",):
-        camp.status = "done"
+    if camp.status == "cancelled":
+        pass
+    else:
+        if bool(getattr(camp, "is_schedule_enabled", False)) and _as_utc(getattr(camp, "next_run_at", None)):
+            camp.status = "scheduled"
+        else:
+            camp.status = "done"
 
     db.add(last_run)
     db.add(camp)
     db.commit()
 
 
-def _start_campaign_run(db: Session, camp: Campaign) -> CampaignRun:
+def _find_existing_run_by_fire_at(db: Session, camp_id, fire_at_utc: datetime) -> Optional[CampaignRun]:
     """
-    Inicia uma campanha:
-    - cria CampaignRun
-    - cria EmailLogs (QUEUED)
-    - COMMIT
-    - enfileira send_email_job para cada log
+    Idempotência forte: se já existe run para (campaign_id, scheduled_fire_at=fire_at),
+    não cria outro.
     """
+    return (
+        db.query(CampaignRun)
+        .filter(CampaignRun.campaign_id == camp_id)
+        .filter(CampaignRun.scheduled_fire_at == fire_at_utc)
+        .order_by(CampaignRun.started_at.desc())
+        .first()
+    )
+
+
+def _start_campaign_run(db: Session, camp: Campaign, fire_at_utc: Optional[datetime], triggered_by: str) -> CampaignRun:
+    """
+    Inicia uma campanha (idempotente quando fire_at_utc é informado):
+    - se já existe run com scheduled_fire_at=fire_at_utc, retorna ele (não duplica)
+    - senão cria:
+      - CampaignRun
+      - EmailLogs (QUEUED)
+      - COMMIT
+      - enfileira send_email_job
+    """
+    fire_at_utc = _as_utc(fire_at_utc)
+
+    if fire_at_utc is not None:
+        existing = _find_existing_run_by_fire_at(db, camp.id, fire_at_utc)
+        if existing:
+            # garante status coerente
+            if camp.status not in ("cancelled",):
+                camp.status = "running"
+                db.add(camp)
+                db.commit()
+            return existing
+
     tpl = db.query(EmailTemplate).filter(EmailTemplate.id == camp.template_id).first()
     if not tpl:
         raise RuntimeError("Template não encontrado para campanha")
@@ -157,7 +198,13 @@ def _start_campaign_run(db: Session, camp: Campaign) -> CampaignRun:
     if not targets:
         raise RuntimeError("Campanha sem targets")
 
-    run = CampaignRun(campaign_id=camp.id, status="running", totals={})
+    run = CampaignRun(
+        campaign_id=camp.id,
+        status="running",
+        totals={},
+        scheduled_fire_at=fire_at_utc,
+        triggered_by=(triggered_by or "manual"),
+    )
     db.add(run)
 
     camp.status = "running"
@@ -198,7 +245,13 @@ def _start_campaign_run(db: Session, camp: Campaign) -> CampaignRun:
             continue
 
         subject_tpl = getattr(tpl, "assunto", None) or getattr(tpl, "subject", None) or ""
-        body_tpl = getattr(tpl, "corpo_html", None) or getattr(tpl, "html", None) or getattr(tpl, "body_html", None) or getattr(tpl, "body", None) or ""
+        body_tpl = (
+            getattr(tpl, "corpo_html", None)
+            or getattr(tpl, "html", None)
+            or getattr(tpl, "body_html", None)
+            or getattr(tpl, "body", None)
+            or ""
+        )
 
         subject_rendered = _render_placeholders(subject_tpl, ctx)
         body_rendered = _render_placeholders(body_tpl, ctx)
@@ -241,9 +294,10 @@ def _start_campaign_run(db: Session, camp: Campaign) -> CampaignRun:
     return run
 
 
-def _run_due_legacy_scheduled(db: Session, now_utc: datetime, batch_size: int) -> tuple[int, int, list[str]]:
+def _run_due_legacy_scheduled(db: Session, now_utc: datetime, batch_size: int) -> Tuple[int, int, List[str]]:
     """
     Legacy: scheduled_at + status='scheduled'
+    Idempotência: scheduled_fire_at = scheduled_at (UTC)
     """
     q = (
         db.query(Campaign)
@@ -257,12 +311,12 @@ def _run_due_legacy_scheduled(db: Session, now_utc: datetime, batch_size: int) -
 
     started = 0
     skipped = 0
-    errors: list[str] = []
+    errors: List[str] = []
 
     for camp in camps:
         try:
-            sched_utc = _as_utc(getattr(camp, "scheduled_at", None))
-            if not sched_utc or sched_utc > now_utc:
+            fire_at = _as_utc(getattr(camp, "scheduled_at", None))
+            if not fire_at or fire_at > now_utc:
                 skipped += 1
                 continue
 
@@ -270,21 +324,12 @@ def _run_due_legacy_scheduled(db: Session, now_utc: datetime, batch_size: int) -
                 skipped += 1
                 continue
 
-            # se já existe run "running", não duplica
-            running_run = (
-                db.query(CampaignRun)
-                .filter(CampaignRun.campaign_id == camp.id)
-                .filter(CampaignRun.status == "running")
-                .order_by(CampaignRun.started_at.desc())
-                .first()
-            )
-            if running_run:
-                camp.status = "running"
-                db.commit()
+            existing = _find_existing_run_by_fire_at(db, camp.id, fire_at)
+            if existing:
                 skipped += 1
                 continue
 
-            _start_campaign_run(db, camp)
+            _start_campaign_run(db, camp, fire_at_utc=fire_at, triggered_by="scheduled_at")
             started += 1
 
         except Exception as e:
@@ -298,9 +343,10 @@ def _run_due_legacy_scheduled(db: Session, now_utc: datetime, batch_size: int) -
     return started, skipped, errors
 
 
-def _run_due_recurring(db: Session, now_utc: datetime, batch_size: int) -> tuple[int, int, list[str]]:
+def _run_due_recurring(db: Session, now_utc: datetime, batch_size: int) -> Tuple[int, int, List[str]]:
     """
     Novo: is_schedule_enabled + next_run_at
+    Idempotência: scheduled_fire_at = next_run_at (UTC)
     """
     q = (
         db.query(Campaign)
@@ -314,61 +360,62 @@ def _run_due_recurring(db: Session, now_utc: datetime, batch_size: int) -> tuple
 
     started = 0
     skipped = 0
-    errors: list[str] = []
+    errors: List[str] = []
 
     for camp in camps:
         try:
-            # tenta finalizar run anterior se já acabou
             _maybe_finalize_last_run(db, camp)
 
             if not _schedule_can_fire(camp):
                 camp.is_schedule_enabled = False
+                camp.next_run_at = None
+                if camp.status not in ("cancelled",):
+                    camp.status = "done"
                 db.add(camp)
                 db.commit()
                 skipped += 1
                 continue
 
-            next_run_utc = _as_utc(getattr(camp, "next_run_at", None))
-            if not next_run_utc or next_run_utc > now_utc:
+            fire_at = _as_utc(getattr(camp, "next_run_at", None))
+            if not fire_at or fire_at > now_utc:
                 skipped += 1
                 continue
 
-            # não dispara se ainda tem run ativo com pendências
-            last_run = (
-                db.query(CampaignRun)
-                .filter(CampaignRun.campaign_id == camp.id)
-                .order_by(CampaignRun.started_at.desc())
-                .first()
-            )
-            if last_run and last_run.status in ("running", "paused"):
-                pending_any = (
-                    db.query(EmailLog.id)
-                    .filter(EmailLog.campaign_run_id == last_run.id)
-                    .filter(EmailLog.status.in_(PENDING_STATUSES))
-                    .first()
-                )
-                if pending_any:
-                    # empurra um pouco pra frente pra não ficar “travando” no vencido
-                    camp.next_run_at = now_utc + timedelta(seconds=30)
-                    db.add(camp)
-                    db.commit()
-                    skipped += 1
-                    continue
+            existing = _find_existing_run_by_fire_at(db, camp.id, fire_at)
+            if existing:
+                # já foi disparado para esse fire time — não duplica
+                skipped += 1
+                continue
 
             # dispara
-            _start_campaign_run(db, camp)
+            _start_campaign_run(db, camp, fire_at_utc=fire_at, triggered_by="recurring")
             started += 1
 
             # atualiza ocorrências
             camp.occurrences = int(getattr(camp, "occurrences", 0) or 0) + 1
 
-            # calcula próximo
-            nxt = _compute_next_run(camp, base_utc=now_utc)
+            # calcula próximo baseado no fire_at (sem drift)
+            nxt = _compute_next_run(camp, base_utc=fire_at)
+
+            # respeita end/max
+            end_at = _as_utc(getattr(camp, "end_at", None))
+            max_occ = getattr(camp, "max_occurrences", None)
+
+            if end_at and nxt and nxt > end_at:
+                nxt = None
+            if max_occ is not None and camp.occurrences >= int(max_occ):
+                nxt = None
+
             camp.next_run_at = nxt
 
-            # se não tem próximo, desativa
             if nxt is None:
                 camp.is_schedule_enabled = False
+                if camp.status not in ("cancelled",):
+                    camp.status = "done"
+            else:
+                # fica "running" durante execução; quando acabar, tasks.py põe "scheduled"
+                if camp.status not in ("cancelled",):
+                    camp.status = "running"
 
             db.add(camp)
             db.commit()
@@ -376,10 +423,9 @@ def _run_due_recurring(db: Session, now_utc: datetime, batch_size: int) -> tuple
         except Exception as e:
             errors.append(f"{camp.id}: {str(e)}")
             try:
-                # não desabilita automaticamente — deixa visível
-                db.commit()
-            except Exception:
                 db.rollback()
+            except Exception:
+                pass
 
     return started, skipped, errors
 

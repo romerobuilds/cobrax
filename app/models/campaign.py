@@ -1,5 +1,6 @@
+# app/models/campaign.py
 import uuid
-from sqlalchemy import Column, String, Text, Integer, ForeignKey, DateTime, Boolean
+from sqlalchemy import Column, Text, Integer, ForeignKey, DateTime, Boolean
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -25,41 +26,34 @@ class Campaign(Base):
     # =========================
     # LEGACY (one-shot scheduling)
     # =========================
-    # usado pelo seu scheduler atual (status="scheduled" e scheduled_at <= now)
     scheduled_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     # =========================
-    # NOVO: scheduling + repetição (Fase C+)
+    # NOVO: scheduling + repetição
     # =========================
-    # se True, o scheduler pode disparar usando next_run_at
     is_schedule_enabled = Column(Boolean, nullable=False, server_default="false")
 
-    # quando começa (primeiro disparo)
     start_at = Column(DateTime(timezone=True), nullable=True)
-
-    # quando deve disparar de novo (scheduler usa isso)
     next_run_at = Column(DateTime(timezone=True), nullable=True, index=True)
 
-    # quando parar
     end_at = Column(DateTime(timezone=True), nullable=True)
-
-    # limite de execuções
     max_occurrences = Column(Integer, nullable=True)
 
-    # quantas execuções já foram disparadas pelo scheduler (novo)
     occurrences = Column(Integer, nullable=False, server_default="0")
 
     # repetição: none | minutes | hours | days | weeks
     repeat_type = Column(Text, nullable=False, server_default="none")
     repeat_every = Column(Integer, nullable=False, server_default="0")
 
-    # para repeat_type=weeks: "0,1,2,3,4,5,6" (seg=0..dom=6)
+    # para repeat_type=weeks: "0,1,2,3,4,5,6" (Mon=0..Sun=6)
     repeat_weekdays = Column(Text, nullable=True)
 
-    # timezone IANA (ex: "America/Sao_Paulo")
     timezone = Column(Text, nullable=False, server_default="America/Sao_Paulo")
 
-    # relações
-    email_logs = relationship("EmailLog", back_populates="campaign", cascade="all, delete-orphan")
+    email_logs = relationship(
+        "EmailLog",
+        back_populates="campaign",
+        cascade="all, delete-orphan",
+    )

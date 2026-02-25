@@ -29,7 +29,8 @@ services:
     depends_on:
       - db
       - redis
-    ports: []
+    ports:
+      - "8000:8000"
     restart: unless-stopped
 
   worker:

@@ -1,20 +1,29 @@
-from app.database_.database import Base
+from __future__ import annotations
+
 import uuid
-from sqlalchemy import Column, String, ForeignKey, DateTime
+from sqlalchemy import Column, String, ForeignKey, DateTime, Boolean, Numeric
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
+
+from app.database_.database import Base
+
 
 class Client(Base):
     __tablename__ = "clients"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
     nome = Column(String, nullable=False)
     email = Column(String, nullable=False)
     telefone = Column(String, nullable=True)
 
+    # NOVOS CAMPOS
+    is_mensalista = Column(Boolean, nullable=False, server_default="false")
+    saldo_aberto = Column(Numeric(12, 2), nullable=False, server_default="0")
+
     owner_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
-    owner = relationship("User", back_populates="clients")   # ✅ ESSE é o que está faltando
+    owner = relationship("User", back_populates="clients")
 
     company_id = Column(UUID(as_uuid=True), ForeignKey("companies.id"), nullable=False)
     company = relationship("Company", back_populates="clients")
@@ -26,4 +35,3 @@ class Client(Base):
         back_populates="client",
         cascade="all, delete-orphan",
     )
-    

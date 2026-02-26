@@ -1,8 +1,8 @@
-# app/routes/client.py
 from __future__ import annotations
 
 import csv
 import io
+from decimal import Decimal, InvalidOperation
 from typing import List, Dict, Any, Optional
 from uuid import UUID
 
@@ -17,7 +17,6 @@ from app.models.company import Company
 from app.models.user import User
 from app.schemas.client import ClientCreate, ClientPublic, ClientUpdate
 
-# XLSX
 from openpyxl import load_workbook
 
 
@@ -120,7 +119,6 @@ def _parse_upload_file(file: UploadFile, raw: bytes, limit: int) -> List[Dict[st
 
 
 def _find_value_ci(row: Dict[str, Any], col: str) -> Optional[str]:
-    """Busca a coluna por match case-insensitive."""
     col = (col or "").strip()
     if not col:
         return None
@@ -133,6 +131,42 @@ def _find_value_ci(row: Dict[str, Any], col: str) -> Optional[str]:
         if (k or "").strip().lower() == target:
             return row.get(k)
     return None
+
+
+def _parse_bool(val: Optional[str]) -> Optional[bool]:
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    if s == "":
+        return None
+    if s in {"1", "true", "t", "yes", "y", "sim", "s"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "nao", "não"}:
+        return False
+    return None
+
+
+def _parse_money(val: Optional[str]) -> Optional[Decimal]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if s == "":
+        return None
+
+    # aceita "R$ 1.234,56" / "1234,56" / "1234.56"
+    s = s.replace("R$", "").replace("r$", "").strip()
+    s = s.replace(" ", "")
+    if "," in s and "." in s:
+        # assume '.' milhares e ',' decimal
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        s = s.replace(",", ".")
+
+    try:
+        d = Decimal(s).quantize(Decimal("0.01"))
+        return d
+    except (InvalidOperation, ValueError):
+        return None
 
 
 # -------------------------
@@ -162,6 +196,8 @@ def criar_cliente(
         telefone=payload.telefone,
         owner_id=user.id,
         company_id=company_id,
+        is_mensalista=bool(payload.is_mensalista),
+        saldo_aberto=payload.saldo_aberto,
     )
     db.add(client)
     db.commit()
@@ -227,6 +263,12 @@ def atualizar_cliente(
     if payload.telefone is not None:
         client.telefone = payload.telefone
 
+    # novos campos
+    if payload.is_mensalista is not None:
+        client.is_mensalista = bool(payload.is_mensalista)
+    if payload.saldo_aberto is not None:
+        client.saldo_aberto = payload.saldo_aberto
+
     db.commit()
     db.refresh(client)
     return client
@@ -255,9 +297,15 @@ def deletar_cliente(
 async def upload_clients_file(
     company_id: UUID,
     file: UploadFile = File(...),
-    email_column: str = Query(default="email", description="Nome da coluna do e-mail (ex: email)"),
-    nome_column: str = Query(default="nome", description="Nome da coluna do nome (ex: nome)"),
-    telefone_column: str = Query(default="telefone", description="Nome da coluna do telefone (ex: telefone)"),
+
+    email_column: str = Query(default="email", description="Nome da coluna do e-mail"),
+    nome_column: str = Query(default="nome", description="Nome da coluna do nome"),
+    telefone_column: str = Query(default="telefone", description="Nome da coluna do telefone"),
+
+    # novos campos na planilha
+    mensalista_column: str = Query(default="mensalista", description="Nome da coluna mensalista (true/false, sim/nao, 1/0)"),
+    saldo_column: str = Query(default="saldo_aberto", description="Nome da coluna saldo (ex: 123,45)"),
+
     limit: int = Query(default=5000, ge=1, le=50000, description="Máximo de linhas lidas"),
     update_existing: bool = Query(default=False, description="Se true, atualiza cliente existente pelo e-mail"),
     db: Session = Depends(get_db),
@@ -265,10 +313,10 @@ async def upload_clients_file(
 ):
     """
     Upload CSV/XLSX de clientes:
-    - email_column: obrigatório por linha
-    - nome/telefone opcionais (se não vierem, deixa como está)
+    - email é obrigatório por linha
+    - nome/telefone/mensalista/saldo opcionais
     - dedupe por email dentro da empresa
-    - update_existing=true => atualiza nome/telefone do cliente existente
+    - update_existing=true => atualiza campos do cliente existente
     """
     _get_company_or_404(db, company_id, user.id)
 
@@ -283,8 +331,9 @@ async def upload_clients_file(
     email_col = (email_column or "email").strip()
     nome_col = (nome_column or "nome").strip()
     tel_col = (telefone_column or "telefone").strip()
+    mensalista_col = (mensalista_column or "mensalista").strip()
+    saldo_col = (saldo_column or "saldo_aberto").strip()
 
-    # cache de emails existentes
     existing = {
         (e or "").lower(): cid
         for (e, cid) in db.query(Client.email, Client.id)
@@ -310,16 +359,20 @@ async def upload_clients_file(
 
         nome_val = _find_value_ci(row, nome_col)
         telefone_val = _find_value_ci(row, tel_col)
+        mensalista_val = _find_value_ci(row, mensalista_col)
+        saldo_val = _find_value_ci(row, saldo_col)
 
         nome = (nome_val or "").strip()
         telefone = (telefone_val or "").strip()
+
+        mensalista_bool = _parse_bool(mensalista_val)
+        saldo_dec = _parse_money(saldo_val)
 
         if email_key in existing:
             if not update_existing:
                 skipped_duplicate += 1
                 continue
 
-            # update existente
             client_id = existing[email_key]
             c = (
                 db.query(Client)
@@ -339,12 +392,15 @@ async def upload_clients_file(
             if telefone:
                 c.telefone = telefone
 
+            if mensalista_bool is not None:
+                c.is_mensalista = mensalista_bool
+            if saldo_dec is not None:
+                c.saldo_aberto = saldo_dec
+
             updated += 1
             continue
 
-        # create novo
         if not nome:
-            # se planilha não tiver nome, cria um fallback
             nome = email.split("@")[0]
 
         c = Client(
@@ -353,11 +409,13 @@ async def upload_clients_file(
             telefone=telefone or None,
             owner_id=user.id,
             company_id=company_id,
+            is_mensalista=bool(mensalista_bool) if mensalista_bool is not None else False,
+            saldo_aberto=saldo_dec if saldo_dec is not None else Decimal("0.00"),
         )
 
         db.add(c)
         try:
-            db.flush()  # pega erros antes do commit
+            db.flush()
             existing[email_key] = c.id
             created += 1
         except IntegrityError:
@@ -376,5 +434,5 @@ async def upload_clients_file(
         "skipped_no_email": int(skipped_no_email),
         "skipped_duplicate": int(skipped_duplicate),
         "errors": errors[:20],
-        "note": "CSV/XLSX: email é obrigatório. update_existing=true atualiza nome/telefone do cliente existente pelo e-mail.",
+        "note": "CSV/XLSX: email obrigatório. Campos opcionais: nome, telefone, mensalista, saldo_aberto. update_existing=true atualiza por email.",
     }

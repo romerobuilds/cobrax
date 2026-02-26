@@ -153,18 +153,16 @@ def _parse_money(val: Optional[str]) -> Optional[Decimal]:
     if s == "":
         return None
 
-    # aceita "R$ 1.234,56" / "1234,56" / "1234.56"
     s = s.replace("R$", "").replace("r$", "").strip()
     s = s.replace(" ", "")
+
     if "," in s and "." in s:
-        # assume '.' milhares e ',' decimal
         s = s.replace(".", "").replace(",", ".")
     else:
         s = s.replace(",", ".")
 
     try:
-        d = Decimal(s).quantize(Decimal("0.01"))
-        return d
+        return Decimal(s).quantize(Decimal("0.01"))
     except (InvalidOperation, ValueError):
         return None
 
@@ -196,8 +194,8 @@ def criar_cliente(
         telefone=payload.telefone,
         owner_id=user.id,
         company_id=company_id,
-        is_mensalista=bool(payload.is_mensalista),
-        saldo_aberto=payload.saldo_aberto,
+        is_mensalista=bool(payload.is_mensalista or False),
+        saldo_aberto=payload.saldo_aberto if payload.saldo_aberto is not None else Decimal("0.00"),
     )
     db.add(client)
     db.commit()
@@ -263,7 +261,7 @@ def atualizar_cliente(
     if payload.telefone is not None:
         client.telefone = payload.telefone
 
-    # novos campos
+    # ✅ novos campos
     if payload.is_mensalista is not None:
         client.is_mensalista = bool(payload.is_mensalista)
     if payload.saldo_aberto is not None:
@@ -302,22 +300,14 @@ async def upload_clients_file(
     nome_column: str = Query(default="nome", description="Nome da coluna do nome"),
     telefone_column: str = Query(default="telefone", description="Nome da coluna do telefone"),
 
-    # novos campos na planilha
-    mensalista_column: str = Query(default="mensalista", description="Nome da coluna mensalista (true/false, sim/nao, 1/0)"),
-    saldo_column: str = Query(default="saldo_aberto", description="Nome da coluna saldo (ex: 123,45)"),
+    mensalista_column: str = Query(default="mensalista", description="Coluna mensalista (sim/nao, true/false, 1/0)"),
+    saldo_column: str = Query(default="saldo_aberto", description="Coluna saldo (ex: 123,45)"),
 
     limit: int = Query(default=5000, ge=1, le=50000, description="Máximo de linhas lidas"),
     update_existing: bool = Query(default=False, description="Se true, atualiza cliente existente pelo e-mail"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """
-    Upload CSV/XLSX de clientes:
-    - email é obrigatório por linha
-    - nome/telefone/mensalista/saldo opcionais
-    - dedupe por email dentro da empresa
-    - update_existing=true => atualiza campos do cliente existente
-    """
     _get_company_or_404(db, company_id, user.id)
 
     raw = await file.read()
@@ -409,7 +399,7 @@ async def upload_clients_file(
             telefone=telefone or None,
             owner_id=user.id,
             company_id=company_id,
-            is_mensalista=bool(mensalista_bool) if mensalista_bool is not None else False,
+            is_mensalista=mensalista_bool if mensalista_bool is not None else False,
             saldo_aberto=saldo_dec if saldo_dec is not None else Decimal("0.00"),
         )
 

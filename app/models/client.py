@@ -1,12 +1,10 @@
-from __future__ import annotations
-
+from app.database_.database import Base
 import uuid
+
 from sqlalchemy import Column, String, ForeignKey, DateTime, Boolean, Numeric
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
-
-from app.database_.database import Base
 
 
 class Client(Base):
@@ -18,7 +16,7 @@ class Client(Base):
     email = Column(String, nullable=False)
     telefone = Column(String, nullable=True)
 
-    # NOVOS CAMPOS
+    # ✅ novos campos
     is_mensalista = Column(Boolean, nullable=False, server_default="false")
     saldo_aberto = Column(Numeric(12, 2), nullable=False, server_default="0")
 

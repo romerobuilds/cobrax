@@ -13,9 +13,9 @@ class ClientCreate(BaseModel):
     email: EmailStr
     telefone: Optional[str] = None
 
-    # NOVOS CAMPOS
-    is_mensalista: bool = False
-    saldo_aberto: Decimal = Field(default=Decimal("0.00"))
+    # ✅ novos campos (opcionais no create)
+    is_mensalista: Optional[bool] = False
+    saldo_aberto: Optional[Decimal] = Decimal("0.00")
 
 
 class ClientUpdate(BaseModel):
@@ -23,7 +23,7 @@ class ClientUpdate(BaseModel):
     email: Optional[EmailStr] = None
     telefone: Optional[str] = None
 
-    # NOVOS CAMPOS
+    # ✅ novos campos
     is_mensalista: Optional[bool] = None
     saldo_aberto: Optional[Decimal] = None
 
@@ -37,27 +37,21 @@ class ClientPublic(BaseModel):
     nome: str
     email: EmailStr
     telefone: Optional[str] = None
+    created_at: datetime
 
-    # NOVOS CAMPOS
+    # ✅ novos campos no response
     is_mensalista: bool
     saldo_aberto: Decimal
 
-    created_at: datetime
-
-
-# =========================
-# UPLOAD (Fase B)
-# =========================
 
 class ClientUploadResult(BaseModel):
     ok: bool = True
-    created: int = 0
+    added: int = 0
     updated: int = 0
     skipped_no_email: int = 0
-    skipped_duplicate: int = 0
+    skipped_invalid: int = 0
     errors: List[str] = Field(default_factory=list)
     note: str = (
-        "Envie CSV/XLSX com colunas: email, nome, telefone, mensalista, saldo_aberto "
-        "(nomes podem ser configurados via query params). "
+        "Envie CSV/XLSX com colunas: email, nome, telefone, mensalista, saldo_aberto. "
         "Se update_existing=true, atualiza cliente existente por email."
     )

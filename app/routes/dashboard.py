@@ -2,20 +2,20 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException
+from sqlalchemy import Date, cast, case, func
 from sqlalchemy.orm import Session
-from sqlalchemy import func, cast, Date
 
-from app.database_.database import get_db
 from app.core.jwt import verificar_token
-from app.models.user import User
-from app.models.company import Company
-from app.models.client import Client
-from app.models.email_template import EmailTemplate
-from app.models.email_log import EmailLog
+from app.database_.database import get_db
 from app.models.campaign import Campaign
-
+from app.models.client import Client
+from app.models.company import Company
+from app.models.email_log import EmailLog
+from app.models.email_template import EmailTemplate
+from app.models.user import User
 
 router = APIRouter(prefix="/empresas", tags=["Dashboard"])
 
@@ -41,7 +41,15 @@ def get_current_user(
     if not user_id:
         raise HTTPException(status_code=401, detail="Token sem 'sub'")
 
-    user = db.query(User).filter(User.id == user_id).first()
+    # User.id é UUID; token vem string
+    try:
+        user_uuid = UUID(str(user_id))
+    except Exception:
+        raise HTTPException(
+            status_code=401, detail="Token 'sub' inválido (UUID esperado)"
+        )
+
+    user = db.query(User).filter(User.id == user_uuid).first()
     if not user:
         raise HTTPException(status_code=401, detail="Usuário não encontrado")
 
@@ -58,7 +66,6 @@ def dashboard_metrics(
     """
     KPI + séries temporais + últimos eventos.
     """
-    # segurança simples: só dono vê
     company = db.query(Company).filter(Company.id == company_id).first()
     if not company:
         raise HTTPException(status_code=404, detail="Empresa não encontrada")
@@ -71,9 +78,26 @@ def dashboard_metrics(
     since = now - timedelta(days=days)
 
     # ---------- KPIs básicos ----------
-    total_clients = db.query(func.count(Client.id)).filter(Client.company_id == company_id).scalar() or 0
-    total_templates = db.query(func.count(EmailTemplate.id)).filter(EmailTemplate.company_id == company_id).scalar() or 0
-    total_campaigns = db.query(func.count(Campaign.id)).filter(Campaign.company_id == company_id).scalar() or 0
+    total_clients = (
+        db.query(func.count(Client.id))
+        .filter(Client.company_id == company_id)
+        .scalar()
+        or 0
+    )
+
+    total_templates = (
+        db.query(func.count(EmailTemplate.id))
+        .filter(EmailTemplate.company_id == company_id)
+        .scalar()
+        or 0
+    )
+
+    total_campaigns = (
+        db.query(func.count(Campaign.id))
+        .filter(Campaign.company_id == company_id)
+        .scalar()
+        or 0
+    )
 
     # ---------- Logs no período ----------
     q_logs_period = db.query(EmailLog).filter(
@@ -84,7 +108,6 @@ def dashboard_metrics(
     sent_period = q_logs_period.filter(func.upper(EmailLog.status) == "SENT").count()
     failed_period = q_logs_period.filter(func.upper(EmailLog.status) == "FAILED").count()
 
-    # pendentes = tudo que não é SENT/FAILED (aprox)
     pending_period = q_logs_period.filter(
         func.upper(EmailLog.status).notin_(["SENT", "FAILED"])
     ).count()
@@ -96,12 +119,15 @@ def dashboard_metrics(
         success_rate = round((sent_period / (sent_period + failed_period)) * 100.0, 2)
 
     # ---------- Série por dia (SENT/FAILED) ----------
-    # usa created_at (porque sempre existe). Se preferir, dá pra trocar por sent_at.
     rows = (
         db.query(
             cast(func.date_trunc("day", EmailLog.created_at), Date).label("day"),
-            func.sum(func.case((func.upper(EmailLog.status) == "SENT", 1), else_=0)).label("sent"),
-            func.sum(func.case((func.upper(EmailLog.status) == "FAILED", 1), else_=0)).label("failed"),
+            func.sum(
+                case((func.upper(EmailLog.status) == "SENT", 1), else_=0)
+            ).label("sent"),
+            func.sum(
+                case((func.upper(EmailLog.status) == "FAILED", 1), else_=0)
+            ).label("failed"),
             func.count(EmailLog.id).label("total"),
         )
         .filter(
@@ -124,9 +150,9 @@ def dashboard_metrics(
             "total": int(r.total or 0),
         }
 
-    # preenche dias faltando
+    # exatamente "days" dias
     series: List[Dict[str, Any]] = []
-    for i in range(days, -1, -1):
+    for i in range(days - 1, -1, -1):
         d = (now - timedelta(days=i)).date().isoformat()
         v = series_map.get(d, {"sent": 0, "failed": 0, "total": 0})
         series.append({"date": d, **v})
@@ -149,7 +175,9 @@ def dashboard_metrics(
             "rate_per_min": getattr(c, "rate_per_min", None),
             "template_id": str(c.template_id),
             "created_at": c.created_at.isoformat() if c.created_at else None,
-            "next_run_at": c.next_run_at.isoformat() if getattr(c, "next_run_at", None) else None,
+            "next_run_at": c.next_run_at.isoformat()
+            if getattr(c, "next_run_at", None)
+            else None,
         }
         for c in recent_campaigns
     ]

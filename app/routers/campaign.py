@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, date
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -28,11 +29,15 @@ from app.models.campaign_target import CampaignTarget
 from app.models.client import Client
 from app.models.email_template import EmailTemplate
 from app.models.email_log import EmailLog
+from app.models.billing_charge import BillingCharge
 
 from app.workers.tasks import send_email_job
 
 # Reuso do parser CSV/XLSX (o mesmo da fase B)
 from app.services.upload_parser import parse_upload_file, normalize_header
+
+# Asaas
+from app.services.asaas_client import ensure_customer, create_boleto_payment
 
 
 router = APIRouter(prefix="/empresas/{company_id}/campanhas", tags=["Campanhas"])
@@ -54,7 +59,6 @@ def _parse_weekdays(s: str | None):
     if not s:
         return None
     return [int(x) for x in s.split(",") if x.strip().isdigit()]
-
 
 def _weekdays_to_str(days: list[int] | None):
     if not days:
@@ -137,18 +141,33 @@ def _recalc_run_stats(db: Session, run_id: str) -> Dict[str, Any]:
 
 
 def _normalize_var_key(h: str) -> str:
-    """
-    Converte header em chave amigável pra {{variavel}}:
-    - trim + remove BOM
-    - lower
-    - espaços -> _
-    - remove chars estranhos
-    """
     s = normalize_header(h)
     s = s.strip().lower()
     s = s.replace(" ", "_")
     s = re.sub(r"[^a-z0-9_]+", "", s)
     return s
+
+
+def _ctx_bool(ctx: Dict[str, Any], key: str, default: bool = False) -> bool:
+    v = (ctx or {}).get(key, default)
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "sim", "s"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "nao", "não"}:
+        return False
+    return default
+
+
+def _ctx_int(ctx: Dict[str, Any], key: str, default: int = 0) -> int:
+    v = (ctx or {}).get(key, default)
+    try:
+        return int(v)
+    except Exception:
+        return default
 
 
 # ======================================================
@@ -182,7 +201,6 @@ def set_schedule(
 ):
     camp = _ensure_campaign_company(db, company_id, campaign_id)
 
-    # validações
     if payload.repeat_type != "none":
         if payload.repeat_every <= 0:
             raise HTTPException(status_code=400, detail="repeat_every deve ser > 0 quando repetir")
@@ -196,7 +214,7 @@ def set_schedule(
     camp.is_schedule_enabled = bool(payload.is_enabled)
 
     camp.start_at = payload.start_at
-    camp.next_run_at = payload.start_at  # primeiro disparo
+    camp.next_run_at = payload.start_at
     camp.timezone = payload.timezone or "America/Sao_Paulo"
 
     camp.repeat_type = payload.repeat_type
@@ -206,7 +224,6 @@ def set_schedule(
     camp.end_at = payload.end_at
     camp.max_occurrences = payload.max_occurrences
 
-    # contador (não reseta)
     camp.occurrences = int(getattr(camp, "occurrences", 0) or 0)
 
     db.add(camp)
@@ -331,7 +348,7 @@ def preview_render(
 
 
 # ======================================================
-# RUNS (coloca antes de "/{campaign_id}" pra evitar conflito)
+# RUNS
 # ======================================================
 
 @router.get("/runs/{run_id}", response_model=CampaignRunOut, operation_id="campaigns_runs_get")
@@ -399,7 +416,6 @@ def create_campaign(company_id: str, body: CampaignCreate, db: Session = Depends
 
     initial_status = "scheduled" if body.scheduled_at is not None else "draft"
 
-    # ✅ NOVO: campos de cobrança/boletos
     camp = Campaign(
         company_id=company_id,
         name=body.name,
@@ -409,12 +425,6 @@ def create_campaign(company_id: str, body: CampaignCreate, db: Session = Depends
         context=body.context or {},
         rate_per_min=int(body.rate_per_min or 15),
         scheduled_at=body.scheduled_at,
-
-        is_cobranca=bool(getattr(body, "is_cobranca", False)),
-        emitir_boletos=bool(getattr(body, "emitir_boletos", False)),
-        anexar_pdf=bool(getattr(body, "anexar_pdf", False)),
-        stop_on_paid=bool(getattr(body, "stop_on_paid", True)),
-        boleto_due_days=int(getattr(body, "boleto_due_days", 3) or 3),
     )
     db.add(camp)
     db.commit()
@@ -693,7 +703,7 @@ async def upload_targets_file(
 
 
 # =========================
-# RUN
+# RUN (com Cobrança/Boletos)
 # =========================
 
 @router.post("/{campaign_id}/run", response_model=CampaignRunOut, operation_id="campaigns_run_start")
@@ -711,6 +721,12 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
     targets = db.query(CampaignTarget).filter(CampaignTarget.campaign_id == camp.id).all()
     if not targets:
         raise HTTPException(status_code=400, detail="Campanha sem targets")
+
+    # flags via context (MVP)
+    ctx_base = dict(camp.context or {})
+    is_cobranca = _ctx_bool(ctx_base, "is_cobranca", False)
+    emitir_boletos = _ctx_bool(ctx_base, "emitir_boletos", False)
+    due_days = max(0, _ctx_int(ctx_base, "due_days", 3))
 
     run = CampaignRun(campaign_id=camp.id, status="running", totals={})
     db.add(run)
@@ -730,24 +746,103 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
 
         to_email = None
         to_name = None
+        client_obj: Client | None = None
 
         if t.client_id:
-            c = db.query(Client).filter(Client.id == t.client_id, Client.company_id == company_id).first()
-            if not c:
+            client_obj = (
+                db.query(Client)
+                .filter(Client.id == t.client_id, Client.company_id == company_id)
+                .first()
+            )
+            if not client_obj:
                 continue
 
-            to_email = getattr(c, "email", None)
-            to_name = getattr(c, "nome", None)
+            to_email = getattr(client_obj, "email", None)
+            to_name = getattr(client_obj, "nome", None)
 
-            if getattr(c, "nome", None) is not None:
-                ctx.setdefault("nome", c.nome)
-            if getattr(c, "email", None) is not None:
-                ctx.setdefault("email", c.email)
+            if getattr(client_obj, "nome", None) is not None:
+                ctx.setdefault("nome", client_obj.nome)
+            if getattr(client_obj, "email", None) is not None:
+                ctx.setdefault("email", client_obj.email)
         else:
             to_email = t.email
 
         if not to_email:
             continue
+
+        # ==========================
+        # COBRANÇA: gera boleto e injeta {{link_boleto}}
+        # ==========================
+        if is_cobranca and emitir_boletos and client_obj is not None:
+            saldo = getattr(client_obj, "saldo_aberto", None)
+            try:
+                saldo_dec = Decimal(str(saldo or "0"))
+            except Exception:
+                saldo_dec = Decimal("0")
+
+            # se não tem saldo, não cobra
+            if saldo_dec <= 0:
+                continue
+
+            due = (datetime.now(timezone.utc) + timedelta(days=due_days)).date()
+            descricao = f"Cobrança COBRAX • Campanha {camp.name}"
+
+            try:
+                customer_id = ensure_customer(name=client_obj.nome, email=client_obj.email)
+                payment = create_boleto_payment(
+                    customer_id=customer_id,
+                    value=saldo_dec,
+                    due_date=due,
+                    description=descricao,
+                    external_reference=str(client_obj.id),
+                )
+
+                asaas_payment_id = str(payment.get("id") or "")
+                invoice_url = payment.get("invoiceUrl")
+                bank_slip_url = payment.get("bankSlipUrl") or payment.get("bankSlipUrl")  # compat
+                pdf_url = payment.get("bankSlipUrl")  # MVP: muitos retornam bankSlipUrl (link)
+
+                # salva mapping pra webhook
+                ch = BillingCharge(
+                    company_id=camp.company_id,
+                    client_id=client_obj.id,
+                    asaas_payment_id=asaas_payment_id or None,
+                    status=str(payment.get("status") or "PENDING"),
+                    value=saldo_dec,
+                    due_date=due,
+                    invoice_url=str(invoice_url) if invoice_url else None,
+                    bank_slip_url=str(bank_slip_url) if bank_slip_url else None,
+                    pdf_url=str(pdf_url) if pdf_url else None,
+                )
+                db.add(ch)
+                db.commit()
+
+                link = invoice_url or bank_slip_url or ""
+                ctx["link_boleto"] = link
+                ctx["valor"] = f"R$ {saldo_dec:.2f}"
+                ctx["vencimento"] = due.strftime("%d/%m/%Y")
+
+            except Exception as e:
+                # se falhar geração do boleto, marca log como FAILED (não tenta enviar email quebrado)
+                log = EmailLog(
+                    company_id=company_id,
+                    client_id=t.client_id,
+                    template_id=camp.template_id,
+                    status="FAILED",
+                    to_email=to_email,
+                    to_name=to_name,
+                    subject_rendered="(falha ao gerar boleto)",
+                    body_rendered=str(e),
+                    attempt_count=0,
+                    last_attempt_at=None,
+                    sent_at=None,
+                    created_at=now,
+                    campaign_id=camp.id,
+                    campaign_run_id=run.id,
+                )
+                db.add(log)
+                db.commit()
+                continue
 
         subject_rendered = _render_placeholders(tpl.assunto or "", ctx)
         body_rendered = _render_placeholders(tpl.corpo_html or "", ctx)
@@ -807,10 +902,6 @@ def list_campaign_runs(company_id: str, campaign_id: str, db: Session = Depends(
     )
     return runs
 
-
-# =========================
-# STATS (REAL TIME)
-# =========================
 
 @router.get("/{campaign_id}/stats", operation_id="campaigns_stats")
 def get_campaign_stats(company_id: str, campaign_id: str, db: Session = Depends(get_db)):

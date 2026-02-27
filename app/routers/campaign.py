@@ -55,6 +55,7 @@ def _parse_weekdays(s: str | None):
         return None
     return [int(x) for x in s.split(",") if x.strip().isdigit()]
 
+
 def _weekdays_to_str(days: list[int] | None):
     if not days:
         return None
@@ -398,6 +399,7 @@ def create_campaign(company_id: str, body: CampaignCreate, db: Session = Depends
 
     initial_status = "scheduled" if body.scheduled_at is not None else "draft"
 
+    # ✅ NOVO: campos de cobrança/boletos
     camp = Campaign(
         company_id=company_id,
         name=body.name,
@@ -407,6 +409,12 @@ def create_campaign(company_id: str, body: CampaignCreate, db: Session = Depends
         context=body.context or {},
         rate_per_min=int(body.rate_per_min or 15),
         scheduled_at=body.scheduled_at,
+
+        is_cobranca=bool(getattr(body, "is_cobranca", False)),
+        emitir_boletos=bool(getattr(body, "emitir_boletos", False)),
+        anexar_pdf=bool(getattr(body, "anexar_pdf", False)),
+        stop_on_paid=bool(getattr(body, "stop_on_paid", True)),
+        boleto_due_days=int(getattr(body, "boleto_due_days", 3) or 3),
     )
     db.add(camp)
     db.commit()

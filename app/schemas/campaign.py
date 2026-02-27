@@ -20,13 +20,6 @@ def _as_utc(dt: datetime | None) -> datetime | None:
 
 
 def _parse_weekdays(v: Any) -> Optional[List[int]]:
-    """
-    Aceita:
-    - None
-    - "0,1,2"
-    - [0,1,2]
-    Retorna: lista ordenada, única, validada 0..6 (0=Seg..6=Dom)
-    """
     if v is None:
         return None
 
@@ -64,10 +57,16 @@ class CampaignCreate(BaseModel):
     # LEGACY: one-shot scheduling
     scheduled_at: Optional[datetime] = None
 
+    # NOVO: cobrança / boletos
+    is_cobranca: bool = False
+    emitir_boletos: bool = False
+    anexar_pdf: bool = False
+    stop_on_paid: bool = True
+    boleto_due_days: int = Field(default=3, ge=0, le=365)
+
     @field_validator("scheduled_at", mode="before")
     @classmethod
     def scheduled_at_before(cls, v):
-        # se vier string ISO, deixa o pydantic converter
         return v
 
     @field_validator("scheduled_at", mode="after")
@@ -89,6 +88,13 @@ class CampaignUpdate(BaseModel):
 
     # LEGACY
     scheduled_at: Optional[datetime] = None
+
+    # NOVO: cobrança / boletos
+    is_cobranca: Optional[bool] = None
+    emitir_boletos: Optional[bool] = None
+    anexar_pdf: Optional[bool] = None
+    stop_on_paid: Optional[bool] = None
+    boleto_due_days: Optional[int] = Field(default=None, ge=0, le=365)
 
     @field_validator("scheduled_at", mode="before")
     @classmethod
@@ -130,6 +136,13 @@ class CampaignOut(BaseModel):
     repeat_every: int = 0
     repeat_weekdays: Optional[List[int]] = None
     timezone: str = "America/Sao_Paulo"
+
+    # NOVO: cobrança / boletos
+    is_cobranca: bool = False
+    emitir_boletos: bool = False
+    anexar_pdf: bool = False
+    stop_on_paid: bool = True
+    boleto_due_days: int = 3
 
     @field_validator("scheduled_at", "start_at", "next_run_at", "end_at", mode="after")
     @classmethod
@@ -182,21 +195,12 @@ class CampaignRunOut(BaseModel):
 # SCHEDULE (Advanced)
 # =============================
 class CampaignScheduleIn(BaseModel):
-    # seu front manda is_enabled
     is_enabled: bool = True
-
-    # quando começa (obrigatório quando is_enabled=True)
-    # seu front manda null quando desabilita -> tem que aceitar Optional
     start_at: Optional[datetime] = None
-
     timezone: str = "America/Sao_Paulo"
-
     repeat_type: RepeatType = "none"
     repeat_every: int = Field(default=0, ge=0)
-
-    # 0=Seg ... 6=Dom (Python weekday)
     repeat_weekdays: Optional[List[int]] = None
-
     end_at: Optional[datetime] = None
     max_occurrences: Optional[int] = Field(default=None, ge=1)
 
@@ -217,8 +221,6 @@ class CampaignScheduleIn(BaseModel):
                 raise ValueError("start_at é obrigatório quando is_enabled=true")
 
             if self.repeat_type == "none":
-                # quando não repete, faz sentido repeat_every=0
-                # (aceita 0 e ignora weekdays)
                 self.repeat_every = 0
                 self.repeat_weekdays = None
             else:
@@ -229,7 +231,6 @@ class CampaignScheduleIn(BaseModel):
                     if not self.repeat_weekdays:
                         raise ValueError("repeat_weekdays é obrigatório quando repeat_type='weeks'")
         else:
-            # desabilitado: pode mandar tudo null/zero
             self.start_at = None
             self.end_at = None
             self.max_occurrences = None

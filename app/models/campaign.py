@@ -52,6 +52,15 @@ class Campaign(Base):
 
     timezone = Column(Text, nullable=False, server_default="America/Sao_Paulo")
 
+    # =========================
+    # NOVO: cobrança / boletos
+    # =========================
+    is_cobranca = Column(Boolean, nullable=False, server_default="false")
+    emitir_boletos = Column(Boolean, nullable=False, server_default="false")
+    anexar_pdf = Column(Boolean, nullable=False, server_default="false")
+    stop_on_paid = Column(Boolean, nullable=False, server_default="true")
+    boleto_due_days = Column(Integer, nullable=False, server_default="3")
+
     email_logs = relationship(
         "EmailLog",
         back_populates="campaign",

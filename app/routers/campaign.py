@@ -1,5 +1,5 @@
 # app/routers/campaign.py
-from __future__ import annotations
+from _future_ import annotations
 
 import re
 from datetime import datetime, timezone, timedelta, date
@@ -37,7 +37,7 @@ from app.workers.tasks import send_email_job
 from app.services.upload_parser import parse_upload_file, normalize_header
 
 # Asaas
-from app.services.asaas_client import ensure_customer, create_boleto_payment
+from app.services.asaas_client import ensure_customer, create_boleto_payment, build_external_reference
 
 
 router = APIRouter(prefix="/empresas/{company_id}/campanhas", tags=["Campanhas"])
@@ -788,34 +788,48 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
             descricao = f"Cobrança COBRAX • Campanha {camp.name}"
 
             try:
+                # 1) cria cobrança local ANTES (pra ter registro mesmo se webhook chegar rápido)
+                ch = BillingCharge(
+                    company_id=camp.company_id,
+                    client_id=client_obj.id,
+                    asaas_payment_id=None,
+                    status="PENDING",
+                    value=saldo_dec,
+                    due_date=due,
+                    invoice_url=None,
+                    bank_slip_url=None,
+                    pdf_url=None,
+                )
+                db.add(ch)
+                db.flush()  # garante ch.id sem commit ainda
+
+                # 2) cria customer + payment no Asaas com externalReference que o webhook entende
                 customer_id = ensure_customer(name=client_obj.nome, email=client_obj.email)
+
+                ext_ref = build_external_reference(str(camp.company_id), str(client_obj.id))
                 payment = create_boleto_payment(
                     customer_id=customer_id,
                     value=saldo_dec,
                     due_date=due,
                     description=descricao,
-                    external_reference=str(client_obj.id),
+                    external_reference=ext_ref,
                 )
 
                 asaas_payment_id = str(payment.get("id") or "")
                 invoice_url = payment.get("invoiceUrl")
-                bank_slip_url = payment.get("bankSlipUrl") or payment.get("bankSlipUrl")  # compat
-                pdf_url = payment.get("bankSlipUrl")  # MVP: muitos retornam bankSlipUrl (link)
+                bank_slip_url = payment.get("bankSlipUrl")
+                pdf_url = bank_slip_url or invoice_url  # MVP
 
-                # salva mapping pra webhook
-                ch = BillingCharge(
-                    company_id=camp.company_id,
-                    client_id=client_obj.id,
-                    asaas_payment_id=asaas_payment_id or None,
-                    status=str(payment.get("status") or "PENDING"),
-                    value=saldo_dec,
-                    due_date=due,
-                    invoice_url=str(invoice_url) if invoice_url else None,
-                    bank_slip_url=str(bank_slip_url) if bank_slip_url else None,
-                    pdf_url=str(pdf_url) if pdf_url else None,
-                )
+                # 3) atualiza a cobrança local com o que veio do Asaas
+                ch.asaas_payment_id = asaas_payment_id or None
+                ch.status = str(payment.get("status") or "PENDING")
+                ch.invoice_url = str(invoice_url) if invoice_url else None
+                ch.bank_slip_url = str(bank_slip_url) if bank_slip_url else None
+                ch.pdf_url = str(pdf_url) if pdf_url else None
+
                 db.add(ch)
                 db.commit()
+                db.refresh(ch)
 
                 link = invoice_url or bank_slip_url or ""
                 ctx["link_boleto"] = link
@@ -823,6 +837,7 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                 ctx["vencimento"] = due.strftime("%d/%m/%Y")
 
             except Exception as e:
+                db.rollback()
                 # se falhar geração do boleto, marca log como FAILED (não tenta enviar email quebrado)
                 log = EmailLog(
                     company_id=company_id,

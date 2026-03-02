@@ -3,14 +3,18 @@ from __future__ import annotations
 
 import os
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Optional
 
 import requests
 
 
+DEFAULT_BASE = "https://api.asaas.com/v3"
+
+
 def _asaas_base_url() -> str:
-    return (os.getenv("ASAAS_BASE_URL") or "https://api.asaas.com/v3").rstrip("/")
+    # Ex: https://sandbox.asaas.com/api/v3
+    return (os.getenv("ASAAS_BASE_URL") or DEFAULT_BASE).strip().rstrip("/")
 
 
 def _asaas_headers() -> Dict[str, str]:
@@ -19,11 +23,37 @@ def _asaas_headers() -> Dict[str, str]:
         raise RuntimeError("ASAAS_API_KEY não configurada no .env")
 
     user_agent = (os.getenv("ASAAS_USER_AGENT") or "COBRAX").strip()
+
+    # Asaas usa header "access_token"
     return {
         "Content-Type": "application/json",
+        "Accept": "application/json",
         "User-Agent": user_agent,
         "access_token": api_key,
     }
+
+
+def _raise_for_status_with_body(resp: requests.Response) -> None:
+    """
+    Melhora a mensagem de erro quando o Asaas responde 4xx/5xx.
+    """
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        body = None
+        try:
+            body = resp.json()
+        except Exception:
+            body = resp.text
+        raise RuntimeError(f"Asaas HTTP {resp.status_code}: {body}") from e
+
+
+def build_external_reference(company_id: str, client_id: str) -> str:
+    """
+    Formato que o seu webhook já sabe interpretar:
+      company:<uuid>|client:<uuid>
+    """
+    return f"company:{company_id}|client:{client_id}"
 
 
 def ensure_customer(name: str, email: str, cpf_cnpj: Optional[str] = None) -> str:
@@ -33,9 +63,14 @@ def ensure_customer(name: str, email: str, cpf_cnpj: Optional[str] = None) -> st
     base = _asaas_base_url()
     headers = _asaas_headers()
 
-    # busca
-    r = requests.get(f"{base}/customers", headers=headers, params={"email": email}, timeout=20)
-    r.raise_for_status()
+    r = requests.get(
+        f"{base}/customers",
+        headers=headers,
+        params={"email": email},
+        timeout=20,
+    )
+    _raise_for_status_with_body(r)
+
     data = r.json() or {}
     items = data.get("data") or []
     if items and items[0].get("id"):
@@ -45,8 +80,14 @@ def ensure_customer(name: str, email: str, cpf_cnpj: Optional[str] = None) -> st
     if cpf_cnpj:
         payload["cpfCnpj"] = cpf_cnpj
 
-    r2 = requests.post(f"{base}/customers", headers=headers, json=payload, timeout=20)
-    r2.raise_for_status()
+    r2 = requests.post(
+        f"{base}/customers",
+        headers=headers,
+        json=payload,
+        timeout=20,
+    )
+    _raise_for_status_with_body(r2)
+
     created = r2.json() or {}
     cid = created.get("id")
     if not cid:
@@ -63,21 +104,31 @@ def create_boleto_payment(
 ) -> Dict[str, Any]:
     """
     Cria cobrança via boleto.
-    Retorna JSON do Asaas (tenta trazer invoiceUrl/bankSlipUrl/pdf).
+    Retorna JSON do Asaas (invoiceUrl/bankSlipUrl/etc).
     """
     base = _asaas_base_url()
     headers = _asaas_headers()
 
+    # evita erro de arredondamento no float
+    value_2 = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
     payload: Dict[str, Any] = {
         "customer": customer_id,
         "billingType": "BOLETO",
-        "value": float(value),  # ok para MVP
+        "value": float(value_2),
         "dueDate": due_date.isoformat(),
         "description": description,
     }
+
+    # ESSENCIAL pro seu webhook mapear e salvar no banco
     if external_reference:
         payload["externalReference"] = external_reference
 
-    r = requests.post(f"{base}/payments", headers=headers, json=payload, timeout=25)
-    r.raise_for_status()
+    r = requests.post(
+        f"{base}/payments",
+        headers=headers,
+        json=payload,
+        timeout=25,
+    )
+    _raise_for_status_with_body(r)
     return r.json() or {}

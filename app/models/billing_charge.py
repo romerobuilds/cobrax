@@ -31,3 +31,4 @@ class BillingCharge(Base):
     # relações
     company = relationship("Company")
     client = relationship("Client")
+    ###

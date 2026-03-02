@@ -1,5 +1,4 @@
 # app/models/billing_charge.py
-# app/models/billing_charge.py
 import uuid
 from datetime import datetime
 from sqlalchemy import Column, String, Numeric, DateTime, ForeignKey

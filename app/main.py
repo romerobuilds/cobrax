@@ -1,4 +1,9 @@
-import app.models  # força carregar tudo antes do ORM ser usado
+from app.models.user import User
+from app.models.company import Company
+from app.models.client import Client
+from app.models.email_template import EmailTemplate
+from app.models.email_log import EmailLog
+from app.models.billing_charge import BillingCharge
 from fastapi import FastAPI
 from app.database_.database import Base, engine
 from app.routers.usuarios import router as usuarios_router
@@ -18,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routers.campaign import router as campaigns_router
 from app.routers.campaign import router as campaign_router
 from app.routes.dashboard import router as dashboard_router
+from app.routers.webhook_asaas import router as asaas_webhook_router
 
 app = FastAPI(
     title="COBRAX",
@@ -61,5 +67,5 @@ app.include_router(worker_status_router)
 app.include_router(campaigns_router)
 app.include_router(campaign_router)
 app.include_router(dashboard_router)
-
+app.include_router(asaas_webhook_router)
 

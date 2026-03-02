@@ -14,11 +14,11 @@ def _asaas_base_url() -> str:
 
 
 def _asaas_headers() -> Dict[str, str]:
-    api_key = os.getenv("ASAAS_API_KEY") or ""
+    api_key = (os.getenv("ASAAS_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("ASAAS_API_KEY não configurada no .env")
 
-    user_agent = os.getenv("ASAAS_USER_AGENT") or "COBRAX"
+    user_agent = (os.getenv("ASAAS_USER_AGENT") or "COBRAX").strip()
     return {
         "Content-Type": "application/json",
         "User-Agent": user_agent,
@@ -38,8 +38,8 @@ def ensure_customer(name: str, email: str, cpf_cnpj: Optional[str] = None) -> st
     r.raise_for_status()
     data = r.json() or {}
     items = data.get("data") or []
-    if items:
-        return str(items[0].get("id"))
+    if items and items[0].get("id"):
+        return str(items[0]["id"])
 
     payload: Dict[str, Any] = {"name": name, "email": email}
     if cpf_cnpj:
@@ -71,7 +71,7 @@ def create_boleto_payment(
     payload: Dict[str, Any] = {
         "customer": customer_id,
         "billingType": "BOLETO",
-        "value": float(value),
+        "value": float(value),  # ok para MVP
         "dueDate": due_date.isoformat(),
         "description": description,
     }

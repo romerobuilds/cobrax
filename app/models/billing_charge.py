@@ -8,7 +8,7 @@ from app.database_.database import Base
 
 
 class BillingCharge(Base):
-    _tablename_ = "billing_charges"
+    __tablename__ = "billing_charges"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 

@@ -18,7 +18,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routers.campaign import router as campaigns_router
 from app.routers.campaign import router as campaign_router
 from app.routes.dashboard import router as dashboard_router
-import app.models
 
 app = FastAPI(
     title="COBRAX",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from decimal import Decimal, InvalidOperation
 from typing import List, Dict, Any, Optional
 from uuid import UUID
@@ -167,6 +168,17 @@ def _parse_money(val: Optional[str]) -> Optional[Decimal]:
         return None
 
 
+def _sanitize_cpf_cnpj(val: Optional[str]) -> Optional[str]:
+    if val is None:
+        return None
+    s = re.sub(r"\D+", "", str(val).strip())
+    if not s:
+        return None
+    if len(s) not in (11, 14):
+        return None
+    return s
+
+
 # -------------------------
 # CRUD
 # -------------------------
@@ -192,6 +204,7 @@ def criar_cliente(
         nome=payload.nome,
         email=str(payload.email),
         telefone=payload.telefone,
+        cpf_cnpj=_sanitize_cpf_cnpj(getattr(payload, "cpf_cnpj", None)),  # ✅ novo
         owner_id=user.id,
         company_id=company_id,
         is_mensalista=bool(payload.is_mensalista or False),
@@ -261,7 +274,14 @@ def atualizar_cliente(
     if payload.telefone is not None:
         client.telefone = payload.telefone
 
-    # ✅ novos campos
+    # ✅ cpf/cnpj (pode ser null pra apagar)
+    if hasattr(payload, "cpf_cnpj") and payload.cpf_cnpj is not None:
+        client.cpf_cnpj = _sanitize_cpf_cnpj(payload.cpf_cnpj)
+    elif hasattr(payload, "cpf_cnpj") and payload.cpf_cnpj is None:
+        # se veio explicitamente null, limpa
+        # (se você não quiser permitir "limpar", remove esse elif)
+        client.cpf_cnpj = None
+
     if payload.is_mensalista is not None:
         client.is_mensalista = bool(payload.is_mensalista)
     if payload.saldo_aberto is not None:
@@ -299,6 +319,7 @@ async def upload_clients_file(
     email_column: str = Query(default="email", description="Nome da coluna do e-mail"),
     nome_column: str = Query(default="nome", description="Nome da coluna do nome"),
     telefone_column: str = Query(default="telefone", description="Nome da coluna do telefone"),
+    cpf_cnpj_column: str = Query(default="cpf_cnpj", description="Coluna cpf_cnpj (somente números)"),
 
     mensalista_column: str = Query(default="mensalista", description="Coluna mensalista (sim/nao, true/false, 1/0)"),
     saldo_column: str = Query(default="saldo_aberto", description="Coluna saldo (ex: 123,45)"),
@@ -321,6 +342,8 @@ async def upload_clients_file(
     email_col = (email_column or "email").strip()
     nome_col = (nome_column or "nome").strip()
     tel_col = (telefone_column or "telefone").strip()
+    cpf_col = (cpf_cnpj_column or "cpf_cnpj").strip()
+
     mensalista_col = (mensalista_column or "mensalista").strip()
     saldo_col = (saldo_column or "saldo_aberto").strip()
 
@@ -349,11 +372,15 @@ async def upload_clients_file(
 
         nome_val = _find_value_ci(row, nome_col)
         telefone_val = _find_value_ci(row, tel_col)
+        cpf_val = _find_value_ci(row, cpf_col)
+
         mensalista_val = _find_value_ci(row, mensalista_col)
         saldo_val = _find_value_ci(row, saldo_col)
 
         nome = (nome_val or "").strip()
         telefone = (telefone_val or "").strip()
+
+        cpf_clean = _sanitize_cpf_cnpj(cpf_val)
 
         mensalista_bool = _parse_bool(mensalista_val)
         saldo_dec = _parse_money(saldo_val)
@@ -382,6 +409,10 @@ async def upload_clients_file(
             if telefone:
                 c.telefone = telefone
 
+            # ✅ cpf_cnpj: se veio válido, atualiza. (se vazio, não mexe)
+            if cpf_clean:
+                c.cpf_cnpj = cpf_clean
+
             if mensalista_bool is not None:
                 c.is_mensalista = mensalista_bool
             if saldo_dec is not None:
@@ -397,6 +428,7 @@ async def upload_clients_file(
             nome=nome,
             email=email,
             telefone=telefone or None,
+            cpf_cnpj=cpf_clean,  # ✅ novo
             owner_id=user.id,
             company_id=company_id,
             is_mensalista=mensalista_bool if mensalista_bool is not None else False,
@@ -424,5 +456,5 @@ async def upload_clients_file(
         "skipped_no_email": int(skipped_no_email),
         "skipped_duplicate": int(skipped_duplicate),
         "errors": errors[:20],
-        "note": "CSV/XLSX: email obrigatório. Campos opcionais: nome, telefone, mensalista, saldo_aberto. update_existing=true atualiza por email.",
+        "note": "CSV/XLSX: email obrigatório. Campos opcionais: nome, telefone, cpf_cnpj, mensalista, saldo_aberto. update_existing=true atualiza por email.",
     }

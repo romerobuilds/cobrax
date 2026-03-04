@@ -1,3 +1,4 @@
+# app/schemas/client.py
 from __future__ import annotations
 
 from datetime import datetime
@@ -13,7 +14,10 @@ class ClientCreate(BaseModel):
     email: EmailStr
     telefone: Optional[str] = None
 
-    # ✅ novos campos (opcionais no create)
+    # ✅ novo
+    cpf_cnpj: Optional[str] = None  # pode vir só dígitos
+
+    # ✅ campos existentes
     is_mensalista: Optional[bool] = False
     saldo_aberto: Optional[Decimal] = Decimal("0.00")
 
@@ -23,7 +27,10 @@ class ClientUpdate(BaseModel):
     email: Optional[EmailStr] = None
     telefone: Optional[str] = None
 
-    # ✅ novos campos
+    # ✅ novo
+    cpf_cnpj: Optional[str] = None  # pode vir só dígitos
+
+    # ✅ existentes
     is_mensalista: Optional[bool] = None
     saldo_aberto: Optional[Decimal] = None
 
@@ -39,7 +46,10 @@ class ClientPublic(BaseModel):
     telefone: Optional[str] = None
     created_at: datetime
 
-    # ✅ novos campos no response
+    # ✅ novo no response
+    cpf_cnpj: Optional[str] = None
+
+    # ✅ existentes
     is_mensalista: bool
     saldo_aberto: Decimal
 
@@ -52,6 +62,6 @@ class ClientUploadResult(BaseModel):
     skipped_invalid: int = 0
     errors: List[str] = Field(default_factory=list)
     note: str = (
-        "Envie CSV/XLSX com colunas: email, nome, telefone, mensalista, saldo_aberto. "
+        "Envie CSV/XLSX com colunas: email, nome, telefone, cpf_cnpj, mensalista, saldo_aberto. "
         "Se update_existing=true, atualiza cliente existente por email."
     )

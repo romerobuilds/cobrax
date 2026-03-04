@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
+import re
 
 from sqlalchemy import func
-from celery.exceptions import Retry  # ✅ importante: não tratar self.retry como "erro"
+from celery.exceptions import Retry
 
 from app.workers.celery_app import celery_app
 from app.database_.database import SessionLocal
@@ -14,51 +15,29 @@ from app.models.plan import Plan
 from app.services.mailer import send_smtp_email
 from app.workers.rate_limiter import throttle_company
 
-# Campanhas
 from app.models.campaign import Campaign
 from app.models.campaign_run import CampaignRun
 
+from app.services.asaas_client import download_url_as_bytes
+
 
 def _same_utc_day(dt) -> bool:
-    """Retorna True se dt está no mesmo dia (UTC) do 'agora'."""
     if not dt:
         return False
     return dt.astimezone(timezone.utc).date() == datetime.now(timezone.utc).date()
 
 
 def _seconds_until_next_utc_0005(now_utc: datetime) -> int:
-    """
-    Calcula quantos segundos faltam até 00:05 UTC do próximo dia.
-    Usa mínimo de 60s para evitar retry imediato.
-    """
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
 
     next_day_date = now_utc.date() + timedelta(days=1)
-    next_run = (
-        datetime.combine(next_day_date, datetime.min.time(), tzinfo=timezone.utc)
-        + timedelta(minutes=5)
-    )
+    next_run = datetime.combine(next_day_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(minutes=5)
     seconds = int((next_run - now_utc).total_seconds())
     return max(60, seconds)
 
 
-def _render_placeholders(text: str, ctx: dict) -> str:
-    """Render simples: troca {{chave}} por valor."""
-    if not text:
-        return ""
-    out = text
-    for k, v in (ctx or {}).items():
-        out = out.replace("{{" + str(k) + "}}", str(v))
-    return out
-
-
 def _recompute_run_totals(db, run_id: str):
-    """
-    Recalcula totals do run com base em email_logs.
-    Inclui CANCELLED e calcula total como soma real dos status.
-    Finaliza run/campanha quando pending_like == 0.
-    """
     rows = (
         db.query(EmailLog.status, func.count(EmailLog.id))
         .filter(EmailLog.campaign_run_id == run_id)
@@ -91,7 +70,6 @@ def _recompute_run_totals(db, run_id: str):
         "by_status": by_status,
     }
 
-    # ✅ finaliza automaticamente quando não tiver pendentes
     if run.status in ("running", "paused") and pending_like == 0:
         if run.status != "cancelled":
             run.status = "finished"
@@ -99,7 +77,6 @@ def _recompute_run_totals(db, run_id: str):
 
         camp = db.query(Campaign).filter(Campaign.id == run.campaign_id).first()
         if camp and camp.status not in ("cancelled",):
-            # ✅ SE FOR RECORRENTE/AGENDADA: volta pra scheduled
             if bool(getattr(camp, "is_schedule_enabled", False)) and getattr(camp, "next_run_at", None) is not None:
                 camp.status = "scheduled"
             else:
@@ -109,19 +86,66 @@ def _recompute_run_totals(db, run_id: str):
 
 
 def _safe_update_totals_after_status_change(db, log: EmailLog | None):
-    """Atualiza totals se o log pertence a um run."""
     if not log:
         return
     if getattr(log, "campaign_run_id", None):
         _recompute_run_totals(db, str(log.campaign_run_id))
 
 
+def _looks_like_html(s: str) -> bool:
+    if not s:
+        return False
+    ss = s.lower()
+    return ("<html" in ss) or ("<div" in ss) or ("<p" in ss) or ("<h" in ss) or ("</" in ss)
+
+
+def _strip_html_simple(html: str) -> str:
+    if not html:
+        return ""
+    txt = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", html)
+    txt = re.sub(r"(?is)<br\s*/?>", "\n", txt)
+    txt = re.sub(r"(?is)</p\s*>", "\n\n", txt)
+    txt = re.sub(r"(?is)<.*?>", "", txt)
+    txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+    return txt
+
+
+def _extract_urls(text: str) -> list[str]:
+    if not text:
+        return []
+    # pega urls http/https
+    urls = re.findall(r"(https?://[^\s\"'<>]+)", text)
+    # remove pontuações comuns no final
+    cleaned = []
+    for u in urls:
+        cleaned.append(u.rstrip(").,;\"'"))
+    return cleaned
+
+
+def _choose_boleto_url(urls: list[str]) -> str | None:
+    if not urls:
+        return None
+
+    # prioridade: bankSlip / boleto / pdf
+    for key in ["bankslip", "boleto"]:
+        for u in urls:
+            if key in u.lower():
+                return u
+
+    for u in urls:
+        if u.lower().endswith(".pdf"):
+            return u
+
+    # fallback: primeiro
+    return urls[0]
+
+
 @celery_app.task(
     bind=True,
     max_retries=3,
     autoretry_for=(Exception,),
-    retry_backoff=True,      # 1m, 2m, 4m...
-    retry_backoff_max=300,   # máx 5 min
+    retry_backoff=True,
+    retry_backoff_max=300,
     retry_jitter=True,
 )
 def send_email_job(self, log_id: str):
@@ -131,7 +155,6 @@ def send_email_job(self, log_id: str):
         if not log:
             return
 
-        # ✅ cancelado? ignora
         if getattr(log, "cancelled_at", None) is not None or log.status == "CANCELLED":
             return
 
@@ -143,7 +166,6 @@ def send_email_job(self, log_id: str):
             _safe_update_totals_after_status_change(db, log)
             return
 
-        # ✅ verifica campanha pausada (ANTES)
         if getattr(log, "campaign_id", None):
             camp = db.query(Campaign).filter(Campaign.id == log.campaign_id).first()
             if camp and camp.status == "paused":
@@ -153,12 +175,10 @@ def send_email_job(self, log_id: str):
                 _safe_update_totals_after_status_change(db, log)
                 return
 
-        # ✅ carrega plano (se houver)
         plan: Plan | None = None
         if getattr(company, "plan_id", None):
             plan = db.query(Plan).filter(Plan.id == company.plan_id).first()
 
-        # ✅ SMTP pausado: não é erro, deixa pendente
         if getattr(company, "smtp_paused", False):
             log.status = "PENDING"
             log.error_message = "SMTP pausado"
@@ -166,7 +186,6 @@ def send_email_job(self, log_id: str):
             _safe_update_totals_after_status_change(db, log)
             return
 
-        # ✅ validações mínimas
         if not log.to_email:
             log.status = "FAILED"
             log.error_message = "Log sem to_email"
@@ -184,32 +203,26 @@ def send_email_job(self, log_id: str):
 
         now = datetime.now(timezone.utc)
 
-        # ✅ reset contador diário (UTC)
         if not _same_utc_day(getattr(company, "emails_sent_today_at", None)):
             company.emails_sent_today = 0
             company.emails_sent_today_at = now
             db.commit()
 
-        # ✅ daily_limit: company override > plan > None (None = ilimitado)
         daily_limit = getattr(company, "daily_email_limit", None)
         if daily_limit is None and plan is not None:
             daily_limit = getattr(plan, "daily_email_limit", None)
 
         sent_today = getattr(company, "emails_sent_today", 0) or 0
 
-        # ✅ bateu limite diário? NÃO FAIL. Marca DEFERRED e reagenda
         if daily_limit is not None and sent_today >= int(daily_limit):
             log.status = "DEFERRED"
-            log.error_message = (
-                f"Limite diário atingido ({sent_today}/{daily_limit}) - reagendado para amanhã (UTC)"
-            )
+            log.error_message = f"Limite diário atingido ({sent_today}/{daily_limit}) - reagendado para amanhã (UTC)"
             db.commit()
             _safe_update_totals_after_status_change(db, log)
 
             countdown = _seconds_until_next_utc_0005(now)
             raise self.retry(countdown=countdown)
 
-        # ✅ rate_per_min: company override > plan > default
         rate_per_min = getattr(company, "rate_per_min", None)
         if rate_per_min is None and plan is not None:
             rate_per_min = getattr(plan, "rate_per_min", None)
@@ -217,7 +230,6 @@ def send_email_job(self, log_id: str):
             rate_per_min = 20
         rate_per_min = int(rate_per_min)
 
-        # ✅ campaign override de rate_per_min (se existir)
         if getattr(log, "campaign_id", None):
             camp = db.query(Campaign).filter(Campaign.id == log.campaign_id).first()
             if camp and getattr(camp, "rate_per_min", None):
@@ -227,7 +239,6 @@ def send_email_job(self, log_id: str):
         if not ok:
             raise self.retry(countdown=3)
 
-        # ✅ marca tentativa
         log.attempt_count = (log.attempt_count or 0) + 1
         log.last_attempt_at = now
         log.status = "SENDING"
@@ -235,14 +246,12 @@ def send_email_job(self, log_id: str):
         db.commit()
         _safe_update_totals_after_status_change(db, log)
 
-        # ✅ checagem final (cancel/pause entre throttle e envio)
         db.refresh(log)
         db.refresh(company)
 
         if getattr(log, "cancelled_at", None) is not None or log.status == "CANCELLED":
             return
 
-        # ✅ RECHECA campanha pausada (DEPOIS)
         if getattr(log, "campaign_id", None):
             camp = db.query(Campaign).filter(Campaign.id == log.campaign_id).first()
             if camp and camp.status == "paused":
@@ -259,7 +268,34 @@ def send_email_job(self, log_id: str):
             _safe_update_totals_after_status_change(db, log)
             return
 
-        # ✅ envia
+        # =========================
+        # ✅ HTML + ANEXO DO BOLETO
+        # =========================
+        body = log.body_rendered or ""
+        body_html = body if _looks_like_html(body) else None
+        body_text = _strip_html_simple(body) if body_html else body
+
+        attachments = []
+        try:
+            urls = _extract_urls(body)
+            boleto_url = _choose_boleto_url(urls)
+
+            if boleto_url:
+                content, content_type = download_url_as_bytes(boleto_url)
+
+                # se vier html por algum motivo, não anexa
+                if content and ("pdf" in (content_type or "").lower() or boleto_url.lower().endswith(".pdf")):
+                    attachments.append(
+                        {
+                            "filename": "boleto.pdf",
+                            "content": content,
+                            "mime": "application/pdf",
+                        }
+                    )
+        except Exception:
+            # não falha envio por causa do anexo — só segue sem anexo
+            pass
+
         send_smtp_email(
             smtp_host=company.smtp_host,
             smtp_port=company.smtp_port,
@@ -270,10 +306,11 @@ def send_email_job(self, log_id: str):
             from_name=company.from_name,
             to_email=log.to_email,
             subject=log.subject_rendered or "(sem assunto)",
-            body_text=log.body_rendered or "",
+            body_text=body_text or "",
+            body_html=body_html,
+            attachments=attachments,
         )
 
-        # ✅ sucesso: incrementa contador diário
         company.emails_sent_today = (getattr(company, "emails_sent_today", 0) or 0) + 1
         company.emails_sent_today_at = now
 
@@ -310,7 +347,6 @@ def send_email_job(self, log_id: str):
 # =========================
 # SCHEDULER (Celery Beat)
 # =========================
-
 from app.workers.scheduler import run_due_campaigns
 
 

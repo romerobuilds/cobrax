@@ -60,6 +60,7 @@ def _parse_weekdays(s: str | None):
         return None
     return [int(x) for x in s.split(",") if x.strip().isdigit()]
 
+
 def _weekdays_to_str(days: list[int] | None):
     if not days:
         return None
@@ -865,6 +866,7 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                     to_name=to_name,
                     subject_rendered="(cobrança requer cliente)",
                     body_rendered="Campanha de cobrança exige targets com client_id (modo selected/all).",
+                    error_message="billing requires client_id",
                     attempt_count=0,
                     last_attempt_at=None,
                     sent_at=None,
@@ -892,6 +894,7 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                     to_name=to_name,
                     subject_rendered="(valor inválido)",
                     body_rendered="Não foi possível determinar um valor > 0. Informe context.vars.valor ou preencha saldo_aberto do cliente.",
+                    error_message="invalid amount",
                     attempt_count=0,
                     last_attempt_at=None,
                     sent_at=None,
@@ -919,24 +922,26 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
             descricao = f"Cobrança COBRAX • Campanha {camp.name}"
 
             try:
-                # cria cobrança local ANTES
+                # 0) garante customer no Asaas (e guarda o id)
+                customer_id = ensure_customer(name=client_obj.nome, email=client_obj.email)
+
+                # 1) cria cobrança local ANTES (campaign_id é NOT NULL no teu schema)
                 ch = BillingCharge(
                     company_id=camp.company_id,
+                    campaign_id=camp.id,  # <<< OBRIGATÓRIO
                     client_id=client_obj.id,
+                    asaas_customer_id=str(customer_id) if customer_id else None,
                     asaas_payment_id=None,
-                    status="PENDING",
                     value=amount,
+                    status="PENDING",
                     due_date=due,
                     invoice_url=None,
                     bank_slip_url=None,
-                    pdf_url=None,
                 )
                 db.add(ch)
-                db.flush()  # garante ch.id
+                db.flush()  # garante ch.id sem commit ainda
 
-                # cria customer + payment no Asaas
-                customer_id = ensure_customer(name=client_obj.nome, email=client_obj.email)
-
+                # 2) cria payment no Asaas
                 ext_ref = build_external_reference(str(camp.company_id), str(client_obj.id))
                 payment = create_boleto_payment(
                     customer_id=customer_id,
@@ -949,13 +954,12 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                 asaas_payment_id = str(payment.get("id") or "")
                 invoice_url = payment.get("invoiceUrl")
                 bank_slip_url = payment.get("bankSlipUrl")
-                pdf_url = bank_slip_url or invoice_url  # MVP
 
+                # 3) atualiza cobrança local com retorno do Asaas
                 ch.asaas_payment_id = asaas_payment_id or None
                 ch.status = str(payment.get("status") or "PENDING")
                 ch.invoice_url = str(invoice_url) if invoice_url else None
                 ch.bank_slip_url = str(bank_slip_url) if bank_slip_url else None
-                ch.pdf_url = str(pdf_url) if pdf_url else None
 
                 db.add(ch)
                 db.commit()
@@ -982,6 +986,7 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                     to_name=to_name,
                     subject_rendered="(falha ao gerar boleto)",
                     body_rendered=str(e),
+                    error_message=str(e),
                     attempt_count=0,
                     last_attempt_at=None,
                     sent_at=None,
@@ -1005,6 +1010,7 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
             to_name=to_name,
             subject_rendered=subject_rendered,
             body_rendered=body_rendered,
+            error_message=None,
             attempt_count=0,
             last_attempt_at=None,
             sent_at=None,
@@ -1038,15 +1044,15 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
 
     # se não gerou nenhum log, finaliza o run pra não ficar eterno
     if created_logs == 0:
-        camp = db.query(Campaign).filter(Campaign.id == camp.id).first()
-        if camp and camp.status == "running":
-            camp.status = "done"
+        camp2 = db.query(Campaign).filter(Campaign.id == camp.id).first()
+        if camp2 and camp2.status == "running":
+            camp2.status = "done"
             db.commit()
 
-        run = db.query(CampaignRun).filter(CampaignRun.id == run.id).first()
-        if run and run.status == "running":
-            run.status = "done"
-            run.finished_at = datetime.now(timezone.utc)
+        run2 = db.query(CampaignRun).filter(CampaignRun.id == run.id).first()
+        if run2 and run2.status == "running":
+            run2.status = "done"
+            run2.finished_at = datetime.now(timezone.utc)
             db.commit()
 
     return run

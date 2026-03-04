@@ -1,3 +1,4 @@
+# app/models/client.py
 from app.database_.database import Base
 import uuid
 
@@ -16,6 +17,9 @@ class Client(Base):
     email = Column(String, nullable=False)
     telefone = Column(String, nullable=True)
 
+    # ✅ CPF/CNPJ do cliente (somente dígitos). Necessário para cobranças no Asaas.
+    cpf_cnpj = Column(String, nullable=True, index=True)
+
     # ✅ novos campos
     is_mensalista = Column(Boolean, nullable=False, server_default="false")
     saldo_aberto = Column(Numeric(12, 2), nullable=False, server_default="0")
@@ -33,4 +37,3 @@ class Client(Base):
         back_populates="client",
         cascade="all, delete-orphan",
     )
-#

@@ -856,7 +856,6 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
         # ==========================
         if is_cobranca and emitir_boletos:
             if client_obj is None:
-                # cobrança precisa de client_id (pra linkar cobrança local)
                 log = EmailLog(
                     company_id=company_id,
                     client_id=None,
@@ -878,7 +877,6 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                 db.commit()
                 continue
 
-            # 1) valor: prioriza ctx["valor"] (ex: "R$ 99,00"), depois saldo_aberto
             amount = _parse_decimal_br(ctx.get("valor"))
             if amount is None:
                 saldo = getattr(client_obj, "saldo_aberto", None)
@@ -906,13 +904,13 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                 db.commit()
                 continue
 
-            due = (datetime.now(timezone.utc) + timedelta(days=due_days)).date()
+            # default due: hoje + due_days
+            due: date = (datetime.now(timezone.utc) + timedelta(days=due_days)).date()
 
             # se o usuário informou vencimento no template vars, tenta usar
             venc = ctx.get("vencimento")
             if venc:
                 try:
-                    # aceita "DD/MM/YYYY"
                     if isinstance(venc, str) and re.match(r"^\d{2}/\d{2}/\d{4}$", venc.strip()):
                         dd, mm, yy = venc.strip().split("/")
                         due = date(int(yy), int(mm), int(dd))
@@ -922,13 +920,13 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
             descricao = f"Cobrança COBRAX • Campanha {camp.name}"
 
             try:
-                # 0) garante customer no Asaas (e guarda o id)
+                # 0) garante customer no Asaas
                 customer_id = ensure_customer(name=client_obj.nome, email=client_obj.email)
 
                 # 1) cria cobrança local ANTES (campaign_id é NOT NULL no teu schema)
                 ch = BillingCharge(
                     company_id=camp.company_id,
-                    campaign_id=camp.id,  # <<< OBRIGATÓRIO
+                    campaign_id=camp.id,
                     client_id=client_obj.id,
                     asaas_customer_id=str(customer_id) if customer_id else None,
                     asaas_payment_id=None,
@@ -967,11 +965,8 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
 
                 link = invoice_url or bank_slip_url or ""
                 ctx["link_boleto"] = link
-
-                # mantém compat com teus templates antigos
                 ctx.setdefault("link_pagamento", link)
 
-                # formata valor/vencimento pra template
                 ctx["valor"] = f"R$ {amount:.2f}"
                 ctx["vencimento"] = due.strftime("%d/%m/%Y")
 
@@ -1042,7 +1037,6 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
         db.commit()
         db.refresh(run)
 
-    # se não gerou nenhum log, finaliza o run pra não ficar eterno
     if created_logs == 0:
         camp2 = db.query(Campaign).filter(Campaign.id == camp.id).first()
         if camp2 and camp2.status == "running":

@@ -1,11 +1,14 @@
 # app/models/client.py
-from app.database_.database import Base
+from __future__ import annotations
+
 import uuid
 
 from sqlalchemy import Column, String, ForeignKey, DateTime, Boolean, Numeric
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
+
+from app.database_.database import Base
 
 
 class Client(Base):
@@ -17,10 +20,19 @@ class Client(Base):
     email = Column(String, nullable=False)
     telefone = Column(String, nullable=True)
 
-    # ✅ CPF/CNPJ do cliente (somente dígitos). Necessário para cobranças no Asaas.
-    cpf_cnpj = Column(String, nullable=True, index=True)
+    # ✅ cobrança/asaas
+    cpf_cnpj = Column(String, nullable=True)  # salvar só números ou com máscara, tanto faz
 
-    # ✅ novos campos
+    # (opcionais - ajudam muito na emissão e em outras integrações)
+    endereco = Column(String, nullable=True)
+    endereco_numero = Column(String, nullable=True)
+    complemento = Column(String, nullable=True)
+    bairro = Column(String, nullable=True)
+    cidade = Column(String, nullable=True)
+    estado = Column(String, nullable=True)
+    cep = Column(String, nullable=True)
+
+    # ✅ seus campos atuais
     is_mensalista = Column(Boolean, nullable=False, server_default="false")
     saldo_aberto = Column(Numeric(12, 2), nullable=False, server_default="0")
 

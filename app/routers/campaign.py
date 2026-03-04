@@ -877,6 +877,30 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                 db.commit()
                 continue
 
+            # CPF/CNPJ (Opção A) - obrigatório pro Asaas criar cobrança
+            cpf_cnpj = getattr(client_obj, "cpf_cnpj", None)
+            if not cpf_cnpj:
+                log = EmailLog(
+                    company_id=company_id,
+                    client_id=client_obj.id,
+                    template_id=camp.template_id,
+                    status="FAILED",
+                    to_email=to_email,
+                    to_name=to_name,
+                    subject_rendered="(CPF/CNPJ ausente)",
+                    body_rendered="Para criar cobrança no Asaas é necessário CPF ou CNPJ do cliente. Preencha clients.cpf_cnpj.",
+                    error_message="missing cpf_cnpj for billing",
+                    attempt_count=0,
+                    last_attempt_at=None,
+                    sent_at=None,
+                    created_at=now,
+                    campaign_id=camp.id,
+                    campaign_run_id=run.id,
+                )
+                db.add(log)
+                db.commit()
+                continue
+
             amount = _parse_decimal_br(ctx.get("valor"))
             if amount is None:
                 saldo = getattr(client_obj, "saldo_aberto", None)
@@ -920,8 +944,12 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
             descricao = f"Cobrança COBRAX • Campanha {camp.name}"
 
             try:
-                # 0) garante customer no Asaas
-                customer_id = ensure_customer(name=client_obj.nome, email=client_obj.email)
+                # 0) garante customer no Asaas (agora com CPF/CNPJ)
+                customer_id = ensure_customer(
+                    name=client_obj.nome,
+                    email=client_obj.email,
+                    cpf_cnpj=cpf_cnpj,
+                )
 
                 # 1) cria cobrança local ANTES (campaign_id é NOT NULL no teu schema)
                 ch = BillingCharge(

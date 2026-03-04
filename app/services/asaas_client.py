@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Optional
@@ -40,7 +41,6 @@ def _raise_for_status_with_body(resp: requests.Response) -> None:
     try:
         resp.raise_for_status()
     except requests.HTTPError as e:
-        body = None
         try:
             body = resp.json()
         except Exception:
@@ -56,12 +56,30 @@ def build_external_reference(company_id: str, client_id: str) -> str:
     return f"company:{company_id}|client:{client_id}"
 
 
+def _sanitize_cpf_cnpj(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    s = re.sub(r"\D+", "", str(value).strip())
+    if not s:
+        return None
+    # CPF 11 / CNPJ 14
+    if len(s) not in (11, 14):
+        return None
+    return s
+
+
 def ensure_customer(name: str, email: str, cpf_cnpj: Optional[str] = None) -> str:
     """
-    MVP: tenta buscar customer por email; se não achar, cria.
+    MVP:
+      - busca customer por email
+      - se existir:
+          - se cpf_cnpj foi informado e customer não tem cpfCnpj, atualiza via PUT
+      - se não existir: cria com cpfCnpj (se válido)
     """
     base = _asaas_base_url()
     headers = _asaas_headers()
+
+    cpf_cnpj_clean = _sanitize_cpf_cnpj(cpf_cnpj)
 
     r = requests.get(
         f"{base}/customers",
@@ -74,16 +92,31 @@ def ensure_customer(name: str, email: str, cpf_cnpj: Optional[str] = None) -> st
     data = r.json() or {}
     items = data.get("data") or []
     if items and items[0].get("id"):
-        return str(items[0]["id"])
+        customer = items[0]
+        cid = str(customer["id"])
 
-    payload: Dict[str, Any] = {"name": name, "email": email}
-    if cpf_cnpj:
-        payload["cpfCnpj"] = cpf_cnpj
+        # se veio cpf/cnpj e o customer não tem, atualiza
+        current_doc = customer.get("cpfCnpj") or customer.get("cpfCnpj")
+        if cpf_cnpj_clean and not current_doc:
+            payload: Dict[str, Any] = {"cpfCnpj": cpf_cnpj_clean}
+            r_upd = requests.put(
+                f"{base}/customers/{cid}",
+                headers=headers,
+                json=payload,
+                timeout=20,
+            )
+            _raise_for_status_with_body(r_upd)
+
+        return cid
+
+    payload_create: Dict[str, Any] = {"name": name, "email": email}
+    if cpf_cnpj_clean:
+        payload_create["cpfCnpj"] = cpf_cnpj_clean
 
     r2 = requests.post(
         f"{base}/customers",
         headers=headers,
-        json=payload,
+        json=payload_create,
         timeout=20,
     )
     _raise_for_status_with_body(r2)

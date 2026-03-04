@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone, timedelta, date
-from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import func
@@ -170,6 +170,74 @@ def _ctx_int(ctx: Dict[str, Any], key: str, default: int = 0) -> int:
         return default
 
 
+def _parse_decimal_br(value: Any) -> Optional[Decimal]:
+    """
+    Aceita: Decimal, int/float, "99.90", "99,90", "R$ 99,90", "R$ 1.234,56"
+    Retorna Decimal ou None.
+    """
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return None
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    s = s.replace("R$", "").replace("r$", "").strip()
+    s = re.sub(r"[^\d,.\-]", "", s)
+
+    # Se tem vírgula e ponto, assume BR: 1.234,56 -> 1234.56
+    if "," in s and "." in s:
+        s = s.replace(".", "")
+        s = s.replace(",", ".")
+    else:
+        # Se só tem vírgula: 99,90 -> 99.90
+        if "," in s and "." not in s:
+            s = s.replace(",", ".")
+
+    try:
+        return Decimal(s)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _split_context(raw: Dict[str, Any] | None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Compat:
+      - Novo: {"vars": {...}, "meta": {...}}
+      - Alternativo: {"vars": {...}, "__meta": {...}}
+      - Antigo (flat): {"valor":..., "is_cobranca": true, ...}
+        -> move chaves de controle pra meta e remove de vars
+    """
+    ctx = dict(raw or {})
+    if isinstance(ctx.get("vars"), dict):
+        vars_ctx = dict(ctx.get("vars") or {})
+        meta_ctx = dict(ctx.get("meta") or ctx.get("__meta") or {})
+        return vars_ctx, meta_ctx
+
+    # flat compat: separa flags conhecidas
+    meta_keys = {"is_cobranca", "emitir_boletos", "due_days"}
+    meta_ctx: Dict[str, Any] = {}
+    vars_ctx: Dict[str, Any] = dict(ctx)
+
+    for k in list(vars_ctx.keys()):
+        if k in meta_keys:
+            meta_ctx[k] = vars_ctx.pop(k)
+
+    return vars_ctx, meta_ctx
+
+
+def _merge_campaign_context(vars_ctx: Dict[str, Any], meta_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    # sempre salva no formato novo (limpo)
+    return {"vars": (vars_ctx or {}), "meta": (meta_ctx or {})}
+
+
 # ======================================================
 # SCHEDULE (NOVO)
 # ======================================================
@@ -328,7 +396,9 @@ def preview_render(
 ):
     tpl = _ensure_template_exists(db, company_id, template_id)
 
-    ctx: Dict[str, Any] = dict(context or {})
+    vars_ctx, _meta_ctx = _split_context(context or {})
+    ctx: Dict[str, Any] = dict(vars_ctx or {})
+
     for k, v in (row or {}).items():
         nk = _normalize_var_key(k)
         if not nk:
@@ -416,13 +486,15 @@ def create_campaign(company_id: str, body: CampaignCreate, db: Session = Depends
 
     initial_status = "scheduled" if body.scheduled_at is not None else "draft"
 
+    # aceita context antigo ou novo, mas salva sempre no formato novo
+    vars_ctx, meta_ctx = _split_context(body.context or {})
     camp = Campaign(
         company_id=company_id,
         name=body.name,
         template_id=body.template_id,
         status=initial_status,
         mode=body.mode or "selected",
-        context=body.context or {},
+        context=_merge_campaign_context(vars_ctx, meta_ctx),
         rate_per_min=int(body.rate_per_min or 15),
         scheduled_at=body.scheduled_at,
     )
@@ -457,6 +529,11 @@ def update_campaign(company_id: str, campaign_id: str, body: CampaignUpdate, db:
 
     scheduled_changed = "scheduled_at" in data
     new_scheduled_at = data.get("scheduled_at", None)
+
+    # normaliza context se vier no patch
+    if "context" in data:
+        vars_ctx, meta_ctx = _split_context(data.get("context") or {})
+        data["context"] = _merge_campaign_context(vars_ctx, meta_ctx)
 
     for k, v in data.items():
         setattr(camp, k, v)
@@ -722,11 +799,13 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
     if not targets:
         raise HTTPException(status_code=400, detail="Campanha sem targets")
 
-    # flags via context (MVP)
-    ctx_base = dict(camp.context or {})
-    is_cobranca = _ctx_bool(ctx_base, "is_cobranca", False)
-    emitir_boletos = _ctx_bool(ctx_base, "emitir_boletos", False)
-    due_days = max(0, _ctx_int(ctx_base, "due_days", 3))
+    # context limpo: vars (template) + meta (controle cobrança)
+    vars_base, meta = _split_context(camp.context or {})
+
+    # flags via meta
+    is_cobranca = _ctx_bool(meta, "is_cobranca", False)
+    emitir_boletos = _ctx_bool(meta, "emitir_boletos", False)
+    due_days = max(0, _ctx_int(meta, "due_days", 3))
 
     run = CampaignRun(campaign_id=camp.id, status="running", totals={})
     db.add(run)
@@ -740,7 +819,8 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
     queued_log_ids: List[str] = []
 
     for t in targets:
-        ctx: Dict[str, Any] = dict(camp.context or {})
+        # ctx que vai para o template: SOMENTE variáveis (não inclui meta)
+        ctx: Dict[str, Any] = dict(vars_base or {})
         if t.payload:
             ctx.update(t.payload)
 
@@ -771,45 +851,96 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
             continue
 
         # ==========================
-        # COBRANÇA: gera boleto e injeta {{link_boleto}}
+        # COBRANÇA: gera boleto e injeta {{link_boleto}} etc
         # ==========================
-        if is_cobranca and emitir_boletos and client_obj is not None:
-            saldo = getattr(client_obj, "saldo_aberto", None)
-            try:
-                saldo_dec = Decimal(str(saldo or "0"))
-            except Exception:
-                saldo_dec = Decimal("0")
+        if is_cobranca and emitir_boletos:
+            if client_obj is None:
+                # cobrança precisa de client_id (pra linkar cobrança local)
+                log = EmailLog(
+                    company_id=company_id,
+                    client_id=None,
+                    template_id=camp.template_id,
+                    status="FAILED",
+                    to_email=to_email,
+                    to_name=to_name,
+                    subject_rendered="(cobrança requer cliente)",
+                    body_rendered="Campanha de cobrança exige targets com client_id (modo selected/all).",
+                    attempt_count=0,
+                    last_attempt_at=None,
+                    sent_at=None,
+                    created_at=now,
+                    campaign_id=camp.id,
+                    campaign_run_id=run.id,
+                )
+                db.add(log)
+                db.commit()
+                continue
 
-            # se não tem saldo, não cobra
-            if saldo_dec <= 0:
+            # 1) valor: prioriza ctx["valor"] (ex: "R$ 99,00"), depois saldo_aberto
+            amount = _parse_decimal_br(ctx.get("valor"))
+            if amount is None:
+                saldo = getattr(client_obj, "saldo_aberto", None)
+                amount = _parse_decimal_br(saldo)
+
+            if amount is None or amount <= 0:
+                log = EmailLog(
+                    company_id=company_id,
+                    client_id=client_obj.id,
+                    template_id=camp.template_id,
+                    status="FAILED",
+                    to_email=to_email,
+                    to_name=to_name,
+                    subject_rendered="(valor inválido)",
+                    body_rendered="Não foi possível determinar um valor > 0. Informe context.vars.valor ou preencha saldo_aberto do cliente.",
+                    attempt_count=0,
+                    last_attempt_at=None,
+                    sent_at=None,
+                    created_at=now,
+                    campaign_id=camp.id,
+                    campaign_run_id=run.id,
+                )
+                db.add(log)
+                db.commit()
                 continue
 
             due = (datetime.now(timezone.utc) + timedelta(days=due_days)).date()
+
+            # se o usuário informou vencimento no template vars, tenta usar
+            venc = ctx.get("vencimento")
+            if venc:
+                try:
+                    # aceita "DD/MM/YYYY"
+                    if isinstance(venc, str) and re.match(r"^\d{2}/\d{2}/\d{4}$", venc.strip()):
+                        dd, mm, yy = venc.strip().split("/")
+                        due = date(int(yy), int(mm), int(dd))
+                except Exception:
+                    pass
+
             descricao = f"Cobrança COBRAX • Campanha {camp.name}"
 
             try:
-                # 1) cria cobrança local ANTES (pra ter registro mesmo se webhook chegar rápido)
+                # cria cobrança local ANTES
                 ch = BillingCharge(
                     company_id=camp.company_id,
                     client_id=client_obj.id,
                     asaas_payment_id=None,
                     status="PENDING",
-                    value=saldo_dec,
+                    value=amount,
                     due_date=due,
                     invoice_url=None,
                     bank_slip_url=None,
                     pdf_url=None,
                 )
                 db.add(ch)
-                db.flush()  # garante ch.id sem commit ainda
+                db.flush()  # garante ch.id
 
-                # 2) cria customer + payment no Asaas com externalReference que o webhook entende
+                # cria customer + payment no Asaas
                 customer_id = ensure_customer(name=client_obj.nome, email=client_obj.email)
 
                 ext_ref = build_external_reference(str(camp.company_id), str(client_obj.id))
                 payment = create_boleto_payment(
                     customer_id=customer_id,
-                    value=saldo_dec,
+                    value=amount,
                     due_date=due,
                     description=descricao,
                     external_reference=ext_ref,
@@ -820,7 +951,6 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                 bank_slip_url = payment.get("bankSlipUrl")
                 pdf_url = bank_slip_url or invoice_url  # MVP
 
-                # 3) atualiza a cobrança local com o que veio do Asaas
                 ch.asaas_payment_id = asaas_payment_id or None
                 ch.status = str(payment.get("status") or "PENDING")
                 ch.invoice_url = str(invoice_url) if invoice_url else None
@@ -833,12 +963,16 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
 
                 link = invoice_url or bank_slip_url or ""
                 ctx["link_boleto"] = link
-                ctx["valor"] = f"R$ {saldo_dec:.2f}"
+
+                # mantém compat com teus templates antigos
+                ctx.setdefault("link_pagamento", link)
+
+                # formata valor/vencimento pra template
+                ctx["valor"] = f"R$ {amount:.2f}"
                 ctx["vencimento"] = due.strftime("%d/%m/%Y")
 
             except Exception as e:
                 db.rollback()
-                # se falhar geração do boleto, marca log como FAILED (não tenta enviar email quebrado)
                 log = EmailLog(
                     company_id=company_id,
                     client_id=t.client_id,
@@ -901,6 +1035,19 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
         }
         db.commit()
         db.refresh(run)
+
+    # se não gerou nenhum log, finaliza o run pra não ficar eterno
+    if created_logs == 0:
+        camp = db.query(Campaign).filter(Campaign.id == camp.id).first()
+        if camp and camp.status == "running":
+            camp.status = "done"
+            db.commit()
+
+        run = db.query(CampaignRun).filter(CampaignRun.id == run.id).first()
+        if run and run.status == "running":
+            run.status = "done"
+            run.finished_at = datetime.now(timezone.utc)
+            db.commit()
 
     return run
 

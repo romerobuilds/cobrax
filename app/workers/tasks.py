@@ -1,4 +1,6 @@
 # app/workers/tasks.py
+import requests
+from app.services.mailer import send_smtp_email, EmailAttachment
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
@@ -12,7 +14,6 @@ from app.database_.database import SessionLocal
 from app.models.email_log import EmailLog
 from app.models.company import Company
 from app.models.plan import Plan
-from app.services.mailer import send_smtp_email
 from app.workers.rate_limiter import throttle_company
 
 from app.models.campaign import Campaign
@@ -296,6 +297,42 @@ def send_email_job(self, log_id: str):
             # não falha envio por causa do anexo — só segue sem anexo
             pass
 
+        # ✅ tenta anexar boleto PDF (Asaas) se existir URL no log
+        attachments = []
+
+        boleto_url = (
+            getattr(log, "asaas_boleto_url", None)
+            or getattr(log, "bank_slip_url", None)
+            or getattr(log, "boleto_url", None)
+            or getattr(log, "attachment_url", None)
+        )
+
+        if boleto_url:
+            try:
+                resp = requests.get(str(boleto_url), timeout=25)
+                resp.raise_for_status()
+
+                # nome do arquivo
+                fname = getattr(log, "attachment_filename", None) or "boleto.pdf"
+                if not str(fname).lower().endswith(".pdf"):
+                    fname = f"{fname}.pdf"
+
+                attachments.append(
+                    EmailAttachment(
+                        filename=str(fname),
+                        content=resp.content,
+                        content_type="application/pdf",
+                    )
+                )
+            except Exception as e:
+                # não falha o envio por causa do anexo, só registra aviso no log
+                log.error_message = f"Falha ao baixar/anexar boleto: {e}"
+                db.commit()
+
+        # ✅ HTML bonitinho (se seu body_rendered for HTML, manda como HTML também)
+        body_rendered = log.body_rendered or ""
+        looks_like_html = "<html" in body_rendered.lower() or "<div" in body_rendered.lower() or "<table" in body_rendered.lower()
+
         send_smtp_email(
             smtp_host=company.smtp_host,
             smtp_port=company.smtp_port,
@@ -306,8 +343,8 @@ def send_email_job(self, log_id: str):
             from_name=company.from_name,
             to_email=log.to_email,
             subject=log.subject_rendered or "(sem assunto)",
-            body_text=body_text or "",
-            body_html=body_html,
+            body_text=body_rendered if not looks_like_html else "Seu cliente de e-mail não suportou HTML. Use o link de pagamento.",
+            body_html=body_rendered if looks_like_html else None,
             attachments=attachments,
         )
 

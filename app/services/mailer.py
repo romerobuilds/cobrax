@@ -1,10 +1,20 @@
 # app/services/mailer.py
-import smtplib
-from typing import Iterable, Optional, Dict, Any, List
+from __future__ import annotations
 
-from email.mime.text import MIMEText
+import smtplib
+from dataclasses import dataclass
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
-from email.mime.application import MIMEApplication
+from email.mime.text import MIMEText
+from email import encoders
+from typing import Iterable, Optional
+
+
+@dataclass
+class EmailAttachment:
+    filename: str
+    content: bytes
+    content_type: str = "application/octet-stream"  # ex: application/pdf
 
 
 def send_smtp_email(
@@ -20,50 +30,46 @@ def send_smtp_email(
     subject: str,
     body_text: str = "",
     body_html: Optional[str] = None,
-    attachments: Optional[List[Dict[str, Any]]] = None,
+    attachments: Optional[Iterable[EmailAttachment]] = None,
 ):
     """
-    attachments: lista de dicts:
-      {
-        "filename": "boleto.pdf",
-        "content": b"...",
-        "mime": "application/pdf"
-      }
+    Envia e-mail SMTP com:
+      - texto (text/plain)
+      - opcional HTML (text/html)
+      - anexos (ex: PDF)
     """
 
-    msg = MIMEMultipart()
+    # Raiz: mixed (pra anexos). Dentro, alternative (plain + html).
+    msg = MIMEMultipart("mixed")
     msg["From"] = f"{from_name} <{from_email}>"
     msg["To"] = to_email
     msg["Subject"] = subject
 
-    # Se tiver HTML, manda multipart/alternative (texto + html)
-    if body_html:
-        alt = MIMEMultipart("alternative")
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(body_text or "", "plain", "utf-8"))
 
-        # sempre manda um texto fallback
-        alt.attach(MIMEText(body_text or "(visualize em um cliente de e-mail HTML)", "plain", "utf-8"))
+    if body_html:
         alt.attach(MIMEText(body_html, "html", "utf-8"))
 
-        msg.attach(alt)
-    else:
-        msg.attach(MIMEText(body_text or "", "plain", "utf-8"))
+    msg.attach(alt)
 
     # anexos
-    for a in (attachments or []):
-        content = a.get("content") or b""
-        filename = a.get("filename") or "anexo.bin"
-        mime = a.get("mime") or "application/octet-stream"
-
-        part = MIMEApplication(content, _subtype=mime.split("/")[-1])
-        part.add_header("Content-Disposition", "attachment", filename=filename)
+    for att in (attachments or []):
+        part = MIMEBase(*att.content_type.split("/", 1)) if "/" in att.content_type else MIMEBase("application", "octet-stream")
+        part.set_payload(att.content)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", f'attachment; filename="{att.filename}"')
+        part.add_header("Content-Type", att.content_type)
         msg.attach(part)
 
     server = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
     try:
         if use_tls:
             server.starttls()
+
         if smtp_user and smtp_password:
             server.login(smtp_user, smtp_password)
+
         server.sendmail(from_email, [to_email], msg.as_string())
     finally:
         server.quit()

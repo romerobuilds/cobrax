@@ -6,6 +6,7 @@ import re
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 
@@ -24,6 +25,7 @@ def _asaas_headers() -> Dict[str, str]:
 
     user_agent = (os.getenv("ASAAS_USER_AGENT") or "COBRAX").strip()
 
+    # Asaas usa header "access_token"
     return {
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -44,6 +46,10 @@ def _raise_for_status_with_body(resp: requests.Response) -> None:
 
 
 def build_external_reference(company_id: str, client_id: str) -> str:
+    """
+    Formato que o seu webhook já sabe interpretar:
+      company:<uuid>|client:<uuid>
+    """
     return f"company:{company_id}|client:{client_id}"
 
 
@@ -53,6 +59,7 @@ def _sanitize_cpf_cnpj(value: Optional[str]) -> Optional[str]:
     s = re.sub(r"\D+", "", str(value).strip())
     if not s:
         return None
+    # CPF 11 / CNPJ 14
     if len(s) not in (11, 14):
         return None
     return s
@@ -60,9 +67,11 @@ def _sanitize_cpf_cnpj(value: Optional[str]) -> Optional[str]:
 
 def ensure_customer(name: str, email: str, cpf_cnpj: Optional[str] = None) -> str:
     """
-    - busca customer por email
-    - se existir e cpf/cnpj veio e customer não tem, atualiza
-    - se não existir: cria já com cpfCnpj (se válido)
+    MVP:
+      - busca customer por email
+      - se existir:
+          - se cpf_cnpj foi informado e customer não tem cpfCnpj, atualiza via PUT
+      - se não existir: cria com cpfCnpj (se válido)
     """
     base = _asaas_base_url()
     headers = _asaas_headers()
@@ -122,6 +131,10 @@ def create_boleto_payment(
     description: str,
     external_reference: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    Cria cobrança via boleto.
+    Retorna JSON do Asaas (invoiceUrl/bankSlipUrl/etc).
+    """
     base = _asaas_base_url()
     headers = _asaas_headers()
 
@@ -134,6 +147,8 @@ def create_boleto_payment(
         "dueDate": due_date.isoformat(),
         "description": description,
     }
+
+    # ESSENCIAL pro seu webhook mapear e salvar no banco
     if external_reference:
         payload["externalReference"] = external_reference
 
@@ -147,15 +162,34 @@ def create_boleto_payment(
     return r.json() or {}
 
 
+def _is_asaas_domain(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    # cobre: api.asaas.com, sandbox.asaas.com, www.asaas.com, asaas.com
+    return host.endswith("asaas.com")
+
+
 def download_url_as_bytes(url: str, timeout: int = 25) -> Tuple[bytes, str]:
     """
     Baixa um URL e retorna (bytes, content_type).
-    Serve pra anexar PDF do boleto.
+
+    Importante:
+    - Se o URL for do Asaas, envia também o access_token (alguns endpoints exigem).
+    - Se NÃO for Asaas, NÃO envia token (evita vazamento).
     """
     if not url:
         raise RuntimeError("URL vazio para download")
 
-    headers = {"User-Agent": (os.getenv("ASAAS_USER_AGENT") or "COBRAX").strip()}
+    user_agent = (os.getenv("ASAAS_USER_AGENT") or "COBRAX").strip()
+    headers: Dict[str, str] = {"User-Agent": user_agent}
+
+    # Só manda token pra domínio Asaas
+    if _is_asaas_domain(url):
+        api_key = (os.getenv("ASAAS_API_KEY") or "").strip()
+        if api_key:
+            headers["access_token"] = api_key
 
     r = requests.get(url, headers=headers, timeout=timeout)
     _raise_for_status_with_body(r)

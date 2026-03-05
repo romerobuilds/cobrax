@@ -9,7 +9,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
 from app.database_.database import Base  # <-- se no seu projeto for outro caminho, ajuste aqui
-
+from sqlalchemy import Boolean
 
 class EmailLog(Base):
     __tablename__ = "email_logs"
@@ -41,6 +41,9 @@ class EmailLog(Base):
     cancelled_reason = Column(Text, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    
+    asaas_bank_slip_url = Column(Text, nullable=True)
+    should_attach_pdf = Column(Boolean, nullable=False, server_default="false")
 
     # =========================
     # RELATIONSHIPS (IMPORTANTE!)
@@ -56,3 +59,4 @@ class EmailLog(Base):
     # ✅ campanhas
     campaign = relationship("Campaign", back_populates="email_logs")
     campaign_run = relationship("CampaignRun", back_populates="email_logs")
+

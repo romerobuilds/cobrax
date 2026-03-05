@@ -1,12 +1,9 @@
 # app/workers/tasks.py
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 import re
-from typing import Optional, List
 
-import requests
 from sqlalchemy import func
 from celery.exceptions import Retry
 
@@ -15,22 +12,13 @@ from app.database_.database import SessionLocal
 from app.models.email_log import EmailLog
 from app.models.company import Company
 from app.models.plan import Plan
-from app.services.mailer import send_smtp_email
 from app.workers.rate_limiter import throttle_company
 
 from app.models.campaign import Campaign
 from app.models.campaign_run import CampaignRun
 
-
-# =========================
-# Helpers
-# =========================
-
-@dataclass
-class EmailAttachment:
-    filename: str
-    content: bytes
-    content_type: str = "application/octet-stream"
+from app.services.mailer import send_smtp_email, EmailAttachment
+from app.services.asaas_client import download_url_as_bytes
 
 
 def _same_utc_day(dt) -> bool:
@@ -59,6 +47,7 @@ def _recompute_run_totals(db, run_id: str):
         .group_by(EmailLog.status)
         .all()
     )
+
     by_status = {str(s): int(c) for s, c in rows}
 
     sent = int(by_status.get("SENT", 0))
@@ -110,7 +99,7 @@ def _looks_like_html(s: str) -> bool:
     if not s:
         return False
     ss = s.lower()
-    return ("<html" in ss) or ("<div" in ss) or ("<p" in ss) or ("<h" in ss) or ("</" in ss) or ("<table" in ss)
+    return ("<html" in ss) or ("<div" in ss) or ("<p" in ss) or ("<h" in ss) or ("</" in ss)
 
 
 def _strip_html_simple(html: str) -> str:
@@ -123,40 +112,6 @@ def _strip_html_simple(html: str) -> str:
     txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
     return txt
 
-
-def _extract_urls(text: str) -> list[str]:
-    if not text:
-        return []
-    urls = re.findall(r"(https?://[^\s\"'<>]+)", text)
-    cleaned = []
-    for u in urls:
-        cleaned.append(u.rstrip(").,;\"'"))
-    return cleaned
-
-
-def _choose_pdf_url(urls: list[str]) -> Optional[str]:
-    if not urls:
-        return None
-    for u in urls:
-        if u.lower().endswith(".pdf"):
-            return u
-    for key in ["bankslip", "boleto"]:
-        for u in urls:
-            if key in u.lower():
-                return u
-    return None
-
-
-def _download_bytes(url: str, timeout: int = 25) -> tuple[bytes, str]:
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    ctype = (r.headers.get("Content-Type") or "").strip()
-    return r.content, ctype
-
-
-# =========================
-# Celery Task
-# =========================
 
 @celery_app.task(
     bind=True,
@@ -222,18 +177,17 @@ def send_email_job(self, log_id: str):
 
         now = datetime.now(timezone.utc)
 
-        # reset contador diário
         if not _same_utc_day(getattr(company, "emails_sent_today_at", None)):
             company.emails_sent_today = 0
             company.emails_sent_today_at = now
             db.commit()
 
-        # daily_limit: company override > plan
         daily_limit = getattr(company, "daily_email_limit", None)
         if daily_limit is None and plan is not None:
             daily_limit = getattr(plan, "daily_email_limit", None)
 
         sent_today = getattr(company, "emails_sent_today", 0) or 0
+
         if daily_limit is not None and sent_today >= int(daily_limit):
             log.status = "DEFERRED"
             log.error_message = f"Limite diário atingido ({sent_today}/{daily_limit}) - reagendado para amanhã (UTC)"
@@ -243,7 +197,6 @@ def send_email_job(self, log_id: str):
             countdown = _seconds_until_next_utc_0005(now)
             raise self.retry(countdown=countdown)
 
-        # rate_per_min: company override > plan > default
         rate_per_min = getattr(company, "rate_per_min", None)
         if rate_per_min is None and plan is not None:
             rate_per_min = getattr(plan, "rate_per_min", None)
@@ -251,7 +204,6 @@ def send_email_job(self, log_id: str):
             rate_per_min = 20
         rate_per_min = int(rate_per_min)
 
-        # override por campanha
         if getattr(log, "campaign_id", None):
             camp = db.query(Campaign).filter(Campaign.id == log.campaign_id).first()
             if camp and getattr(camp, "rate_per_min", None):
@@ -261,10 +213,10 @@ def send_email_job(self, log_id: str):
         if not ok:
             raise self.retry(countdown=3)
 
-        # marca tentativa
         log.attempt_count = (log.attempt_count or 0) + 1
         log.last_attempt_at = now
         log.status = "SENDING"
+        # não apaga error_message aqui (pode ter info útil), mas podemos limpar:
         log.error_message = None
         db.commit()
         _safe_update_totals_after_status_change(db, log)
@@ -275,7 +227,7 @@ def send_email_job(self, log_id: str):
         if getattr(log, "cancelled_at", None) is not None or log.status == "CANCELLED":
             return
 
-        # re-checa pausa
+        # campanha pausada (depois)
         if getattr(log, "campaign_id", None):
             camp = db.query(Campaign).filter(Campaign.id == log.campaign_id).first()
             if camp and camp.status == "paused":
@@ -293,40 +245,24 @@ def send_email_job(self, log_id: str):
             return
 
         # =========================
-        # ✅ HTML + TEXTO FALLBACK
+        # HTML + TEXTO + ANEXOS
         # =========================
-        body_raw = log.body_rendered or ""
-        is_html = _looks_like_html(body_raw)
+        body = log.body_rendered or ""
+        body_html = body if _looks_like_html(body) else None
+        body_text = _strip_html_simple(body) if body_html else body
 
-        body_html = body_raw if is_html else None
-        body_text = _strip_html_simple(body_raw) if is_html else body_raw
+        attachments: list[EmailAttachment] = []
 
-        # =========================
-        # ✅ ANEXO (regra que você pediu)
-        # =========================
-        attachments: List[EmailAttachment] = []
-
-        attach_pdf_flag = bool(getattr(log, "attach_boleto_pdf", False))
-
-        if attach_pdf_flag:
-            boleto_pdf_url = (
-                getattr(log, "boleto_pdf_url", None)
-                or getattr(log, "bank_slip_url", None)
-                or getattr(log, "boleto_url", None)
-                or getattr(log, "attachment_url", None)
-            )
-
-            # fallback: tenta achar pdf no próprio corpo
-            if not boleto_pdf_url:
-                urls = _extract_urls(body_raw)
-                boleto_pdf_url = _choose_pdf_url(urls)
-
-            if boleto_pdf_url:
+        # ✅ Só anexa se a regra mandou anexar (calculada lá na criação do EmailLog)
+        if bool(getattr(log, "should_attach_pdf", False)):
+            boleto_url = (getattr(log, "asaas_bank_slip_url", None) or "").strip()
+            if boleto_url:
                 try:
-                    content, ctype = _download_bytes(str(boleto_pdf_url), timeout=25)
+                    content, content_type = download_url_as_bytes(boleto_url)
+                    ct = (content_type or "").lower()
 
-                    # força pdf se der pra deduzir
-                    if "pdf" in (ctype or "").lower() or str(boleto_pdf_url).lower().endswith(".pdf"):
+                    is_pdf = ("application/pdf" in ct) or boleto_url.lower().endswith(".pdf")
+                    if content and is_pdf:
                         attachments.append(
                             EmailAttachment(
                                 filename="boleto.pdf",
@@ -334,14 +270,18 @@ def send_email_job(self, log_id: str):
                                 content_type="application/pdf",
                             )
                         )
+                    else:
+                        # não falha envio, só registra o motivo
+                        log.error_message = f"URL do boleto não retornou PDF (content-type={content_type})"
+                        db.commit()
                 except Exception as e:
-                    # não derruba o envio por falha no anexo
-                    log.error_message = f"Falha ao baixar/anexar boleto PDF: {e}"
+                    # não falha o envio por causa do anexo
+                    log.error_message = f"Falha ao baixar/anexar boleto: {e}"
                     db.commit()
+            else:
+                log.error_message = "should_attach_pdf=true mas asaas_bank_slip_url está vazio"
+                db.commit()
 
-        # =========================
-        # ✅ ENVIO
-        # =========================
         send_smtp_email(
             smtp_host=company.smtp_host,
             smtp_port=company.smtp_port,
@@ -352,19 +292,16 @@ def send_email_job(self, log_id: str):
             from_name=company.from_name,
             to_email=log.to_email,
             subject=log.subject_rendered or "(sem assunto)",
-            body_text=body_text or "",
+            body_text=body_text,
             body_html=body_html,
             attachments=attachments,
         )
 
-        # sucesso
         company.emails_sent_today = (getattr(company, "emails_sent_today", 0) or 0) + 1
         company.emails_sent_today_at = now
 
         log.status = "SENT"
         log.sent_at = now
-        # se tinha warning de anexo, mantemos; mas se quiser zerar sempre, descomente:
-        # log.error_message = None
         db.commit()
         _safe_update_totals_after_status_change(db, log)
 
@@ -377,6 +314,7 @@ def send_email_job(self, log_id: str):
             if log2:
                 if getattr(log2, "cancelled_at", None) is not None or log2.status == "CANCELLED":
                     return
+
                 retries_left = self.max_retries - self.request.retries
                 log2.status = "RETRYING" if retries_left > 0 else "FAILED"
                 log2.error_message = str(e)
@@ -384,15 +322,13 @@ def send_email_job(self, log_id: str):
                 _safe_update_totals_after_status_change(db, log2)
         except Exception:
             pass
+
         raise
 
     finally:
         db.close()
 
 
-# =========================
-# SCHEDULER (Celery Beat)
-# =========================
 from app.workers.scheduler import run_due_campaigns
 
 

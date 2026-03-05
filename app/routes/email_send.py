@@ -47,20 +47,21 @@ def _template_uses_link_pagamento(template: EmailTemplate) -> bool:
     Fazemos a checagem no template bruto (antes de renderizar).
     """
     needle = "{{link_pagamento}}"
-    subj = (getattr(template, "assunto", None) or "") + ""
-    body = (getattr(template, "corpo_html", None) or "") + ""
-    return needle in subj or needle in body
+    subj = (getattr(template, "assunto", None) or "")
+    body = (getattr(template, "corpo_html", None) or "")
+    return (needle in subj) or (needle in body)
 
 
 def _is_billing_context(extra_ctx: Dict[str, Any] | None) -> bool:
     """
-    Heurística simples: se payload.context tem cara de cobrança.
-    (Porque envio manual de template não tem "tipo de campanha" aqui.)
+    Heurística simples para "parece cobrança".
+    Como envio manual não tem campaign_id/tipo, usamos as chaves do context.
     """
     if not extra_ctx:
         return False
 
-    keys = set(str(k).lower() for k in extra_ctx.keys())
+    keys = {str(k).strip().lower() for k in extra_ctx.keys()}
+
     billing_keys = {
         "valor",
         "vencimento",
@@ -74,8 +75,10 @@ def _is_billing_context(extra_ctx: Dict[str, Any] | None) -> bool:
         "boleto_pdf_url",
         "bankslipurl",
         "bankslip_url",
+        "bank_slip_url",
         "invoiceurl",
         "invoice_url",
+        "payment_url",
     }
     return any(k in keys for k in billing_keys)
 
@@ -90,12 +93,16 @@ def _pick_payment_url(extra_ctx: Dict[str, Any] | None) -> str | None:
 
 
 def _pick_boleto_pdf_url(extra_ctx: Dict[str, Any] | None) -> str | None:
+    """
+    Atenção: no Asaas, o campo que costuma vir é bankSlipUrl (geralmente PDF/URL do boleto).
+    """
     if not extra_ctx:
         return None
     for k in [
         "boleto_pdf_url",
         "bankSlipUrl",
         "bank_slip_url",
+        "bankSlipURL",
         "bankslipUrl",
         "bankslip_url",
         "boleto_url",
@@ -141,7 +148,7 @@ def enviar_template(
 
     extra_ctx: Dict[str, Any] = payload.context or {}
 
-    # Renderiza (com variáveis padrão + extras do payload)
+    # Renderiza (variáveis padrão + extras do payload)
     context = build_default_context(company=company, client=client, extra=extra_ctx)
 
     try:
@@ -156,15 +163,14 @@ def enviar_template(
     uses_link = _template_uses_link_pagamento(template)
     is_billing = _is_billing_context(extra_ctx)
 
-    # ✅ Regra que você pediu:
+    # ✅ Regra:
     # - se usa {{link_pagamento}} -> não anexa
-    # - se NÃO usa e é cobrança -> anexa
-    attach_pdf = bool(is_billing and (not uses_link))
+    # - se NÃO usa e é cobrança -> tenta anexar
+    should_attach_pdf = bool(is_billing and (not uses_link))
 
     payment_url = _pick_payment_url(extra_ctx)
     boleto_pdf_url = _pick_boleto_pdf_url(extra_ctx)
 
-    # ✅ Cria log PENDING ANTES de enviar
     log = EmailLog(
         company_id=company_id,
         client_id=client.id,
@@ -176,26 +182,33 @@ def enviar_template(
         body_rendered=rendered.body,
     )
 
-    # ✅ Se seu model tiver esses campos, salva (senão, ignora sem quebrar)
-    if hasattr(log, "attach_boleto_pdf"):
-        setattr(log, "attach_boleto_pdf", attach_pdf)
+    # ✅ grava flags/urls se existirem no model
+    # (isso evita quebrar caso seu model ainda esteja diferente)
+    if hasattr(log, "should_attach_pdf"):
+        setattr(log, "should_attach_pdf", should_attach_pdf)
+
+    # Aqui guardamos a URL do boleto (PDF/URL do Asaas) para o worker anexar.
+    # Preferimos a do boleto; se não tiver, guarda payment_url como fallback.
+    if hasattr(log, "asaas_bank_slip_url"):
+        setattr(log, "asaas_bank_slip_url", boleto_pdf_url or None)
+
     if hasattr(log, "payment_url"):
-        setattr(log, "payment_url", payment_url)
-    if hasattr(log, "boleto_pdf_url"):
-        setattr(log, "boleto_pdf_url", boleto_pdf_url)
+        setattr(log, "payment_url", payment_url or None)
 
     db.add(log)
     db.commit()
     db.refresh(log)
 
-    # ✅ Enfileira
     try:
         send_email_job.delay(str(log.id))
     except Exception as e:
         log.status = "FAILED"
         log.error_message = f"Falha ao enfileirar job: {e}"
         db.commit()
-        raise HTTPException(status_code=500, detail="Fila/worker não disponível. Verifique Redis/Celery.")
+        raise HTTPException(
+            status_code=500,
+            detail="Fila/worker não disponível. Verifique Redis/Celery.",
+        )
 
     return EmailSendResponse(
         log_id=log.id,

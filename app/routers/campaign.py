@@ -820,6 +820,10 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
     queued_log_ids: List[str] = []
 
     for t in targets:
+        # por segurança: defaults por target (evita variável "vazar" de um loop pro outro)
+        bank_slip_url_for_log: str | None = None
+        should_attach_for_log: bool = False
+
         # ctx que vai para o template: SOMENTE variáveis (não inclui meta)
         ctx: Dict[str, Any] = dict(vars_base or {})
         if t.payload:
@@ -856,6 +860,7 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
         # ==========================
         if is_cobranca and emitir_boletos:
             if client_obj is None:
+                # ✅ CORRETO: cobrança exige client_id (não dá pra gerar boleto com target só por email)
                 log = EmailLog(
                     company_id=company_id,
                     client_id=None,
@@ -981,6 +986,14 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                 invoice_url = payment.get("invoiceUrl")
                 bank_slip_url = payment.get("bankSlipUrl")
 
+                # ✅ regra: se template usa {{link_pagamento}}, NÃO anexa pdf
+                template_has_link = ("{{link_pagamento}}" in (tpl.assunto or "")) or ("{{link_pagamento}}" in (tpl.corpo_html or ""))
+                should_attach = bool(bank_slip_url) and (not template_has_link)
+
+                # guarda pro EmailLog final
+                bank_slip_url_for_log = str(bank_slip_url) if bank_slip_url else None
+                should_attach_for_log = bool(should_attach)
+
                 # 3) atualiza cobrança local com retorno do Asaas
                 ch.asaas_payment_id = asaas_payment_id or None
                 ch.status = str(payment.get("status") or "PENDING")
@@ -1041,6 +1054,16 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
             campaign_id=camp.id,
             campaign_run_id=run.id,
         )
+
+        # ✅ NOVO: worker vai anexar PDF SOMENTE se essa flag for true
+        if hasattr(log, "should_attach_pdf"):
+            log.should_attach_pdf = bool(is_cobranca and emitir_boletos and should_attach_for_log)
+
+        # ✅ NOVO: URL do bankSlipUrl (do Asaas) pro worker baixar e anexar
+        if hasattr(log, "asaas_bank_slip_url"):
+            log.asaas_bank_slip_url = (
+                str(bank_slip_url_for_log) if (getattr(log, "should_attach_pdf", False) and bank_slip_url_for_log) else None
+            )
 
         db.add(log)
         db.flush()

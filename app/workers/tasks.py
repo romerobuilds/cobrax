@@ -1,7 +1,6 @@
-# app/workers/tasks.py
+from __future__ import annotations
 import requests
 from app.services.mailer import send_smtp_email, EmailAttachment
-from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
 import re

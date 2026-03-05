@@ -1,5 +1,8 @@
 # app/routes/email_send.py
+from __future__ import annotations
+
 from uuid import UUID
+from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -18,7 +21,6 @@ from app.schemas.email_send import EmailSendRequest, EmailSendResponse
 from app.core.template_vars import build_default_context
 from app.services.template_renderer import render_email_template
 
-# ✅ fila/worker
 from app.workers.tasks import send_email_job
 
 
@@ -39,10 +41,75 @@ def _get_company_or_404(db: Session, company_id: UUID, user: User) -> Company:
     return company
 
 
+def _template_uses_link_pagamento(template: EmailTemplate) -> bool:
+    """
+    Regra: se o template usa {{link_pagamento}}, NÃO precisa anexar PDF.
+    Fazemos a checagem no template bruto (antes de renderizar).
+    """
+    needle = "{{link_pagamento}}"
+    subj = (getattr(template, "assunto", None) or "") + ""
+    body = (getattr(template, "corpo_html", None) or "") + ""
+    return needle in subj or needle in body
+
+
+def _is_billing_context(extra_ctx: Dict[str, Any] | None) -> bool:
+    """
+    Heurística simples: se payload.context tem cara de cobrança.
+    (Porque envio manual de template não tem "tipo de campanha" aqui.)
+    """
+    if not extra_ctx:
+        return False
+
+    keys = set(str(k).lower() for k in extra_ctx.keys())
+    billing_keys = {
+        "valor",
+        "vencimento",
+        "numero_fatura",
+        "fatura",
+        "descricao",
+        "observacao",
+        "link_pagamento",
+        "link_boleto",
+        "boleto_url",
+        "boleto_pdf_url",
+        "bankslipurl",
+        "bankslip_url",
+        "invoiceurl",
+        "invoice_url",
+    }
+    return any(k in keys for k in billing_keys)
+
+
+def _pick_payment_url(extra_ctx: Dict[str, Any] | None) -> str | None:
+    if not extra_ctx:
+        return None
+    for k in ["link_pagamento", "invoiceUrl", "invoice_url", "payment_url", "link_boleto"]:
+        if k in extra_ctx and extra_ctx.get(k):
+            return str(extra_ctx.get(k))
+    return None
+
+
+def _pick_boleto_pdf_url(extra_ctx: Dict[str, Any] | None) -> str | None:
+    if not extra_ctx:
+        return None
+    for k in [
+        "boleto_pdf_url",
+        "bankSlipUrl",
+        "bank_slip_url",
+        "bankslipUrl",
+        "bankslip_url",
+        "boleto_url",
+        "pdf_url",
+    ]:
+        if k in extra_ctx and extra_ctx.get(k):
+            return str(extra_ctx.get(k))
+    return None
+
+
 @router.post(
     "/send",
     response_model=EmailSendResponse,
-    status_code=status.HTTP_202_ACCEPTED,  # ✅ agora é async via fila
+    status_code=status.HTTP_202_ACCEPTED,
 )
 def enviar_template(
     company_id: UUID,
@@ -72,8 +139,10 @@ def enviar_template(
     if not client:
         raise HTTPException(status_code=404, detail="Cliente não encontrado")
 
+    extra_ctx: Dict[str, Any] = payload.context or {}
+
     # Renderiza (com variáveis padrão + extras do payload)
-    context = build_default_context(company=company, client=client, extra=payload.context)
+    context = build_default_context(company=company, client=client, extra=extra_ctx)
 
     try:
         rendered = render_email_template(
@@ -84,7 +153,18 @@ def enviar_template(
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Erro ao renderizar template: {e}")
 
-    # ✅ Cria log PENDING ANTES de enviar (agora com to_email/to_name)
+    uses_link = _template_uses_link_pagamento(template)
+    is_billing = _is_billing_context(extra_ctx)
+
+    # ✅ Regra que você pediu:
+    # - se usa {{link_pagamento}} -> não anexa
+    # - se NÃO usa e é cobrança -> anexa
+    attach_pdf = bool(is_billing and (not uses_link))
+
+    payment_url = _pick_payment_url(extra_ctx)
+    boleto_pdf_url = _pick_boleto_pdf_url(extra_ctx)
+
+    # ✅ Cria log PENDING ANTES de enviar
     log = EmailLog(
         company_id=company_id,
         client_id=client.id,
@@ -95,15 +175,23 @@ def enviar_template(
         subject_rendered=rendered.subject,
         body_rendered=rendered.body,
     )
+
+    # ✅ Se seu model tiver esses campos, salva (senão, ignora sem quebrar)
+    if hasattr(log, "attach_boleto_pdf"):
+        setattr(log, "attach_boleto_pdf", attach_pdf)
+    if hasattr(log, "payment_url"):
+        setattr(log, "payment_url", payment_url)
+    if hasattr(log, "boleto_pdf_url"):
+        setattr(log, "boleto_pdf_url", boleto_pdf_url)
+
     db.add(log)
     db.commit()
     db.refresh(log)
 
-    # ✅ Enfileira (não envia aqui)
+    # ✅ Enfileira
     try:
         send_email_job.delay(str(log.id))
     except Exception as e:
-        # Se a fila não estiver rodando, marca FAIL e devolve erro claro
         log.status = "FAILED"
         log.error_message = f"Falha ao enfileirar job: {e}"
         db.commit()
@@ -111,6 +199,6 @@ def enviar_template(
 
     return EmailSendResponse(
         log_id=log.id,
-        status=log.status,        # PENDING
+        status=log.status,
         subject=rendered.subject,
     )

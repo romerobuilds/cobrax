@@ -1,5 +1,8 @@
 # app/models/billing_charge.py
+from __future__ import annotations
+
 import uuid
+
 from sqlalchemy import Column, String, Numeric, Date, DateTime, ForeignKey, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
@@ -29,9 +32,13 @@ class BillingCharge(Base):
 
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     paid_at = Column(DateTime(timezone=True), nullable=True)
-    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
 
-    # relações
     company = relationship("Company")
     campaign = relationship("Campaign")
     client = relationship("Client")

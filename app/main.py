@@ -1,29 +1,35 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.database_.database import Base, engine
+
 from app.models.user import User
 from app.models.company import Company
 from app.models.client import Client
 from app.models.email_template import EmailTemplate
 from app.models.email_log import EmailLog
 from app.models.billing_charge import BillingCharge
-from fastapi import FastAPI
-from app.database_.database import Base, engine
+
+from app.models import user, company, client, email_template
+
 from app.routers.usuarios import router as usuarios_router
+from app.routers.health import router as health_router
+from app.routers.campaign import router as campaigns_router
+from app.routers.webhook_asaas import router as asaas_webhook_router
+from app.routers.billing import router as billing_router
+
 from app.routes.auth import router as auth_router
 from app.routes.company import router as company_router
-from app.routers.health import router as health_router
 from app.routes.client import router as client_router
 from app.routes.email_template import router as templates_router
-from app.models import user, company, client, email_template
 from app.routes.email_log import router as email_log_router
 from app.routes.email_send import router as email_send_router
 from app.routes import email_send_bulk
 from app.routes.email_admin import router as email_admin_router
 from app.routes.plan_admin import router as plan_admin_router
 from app.routes.worker_status import router as worker_status_router
-from fastapi.middleware.cors import CORSMiddleware
-from app.routers.campaign import router as campaigns_router
-from app.routers.campaign import router as campaign_router
 from app.routes.dashboard import router as dashboard_router
-from app.routers.webhook_asaas import router as asaas_webhook_router
+
 
 app = FastAPI(
     title="COBRAX",
@@ -36,6 +42,7 @@ origins = [
     "http://95.216.138.163:5173",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "https://cobrax.tech",
 ]
 
 app.add_middleware(
@@ -45,8 +52,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
 
 # @app.on_event("startup")
 # def startup():
@@ -65,7 +70,6 @@ app.include_router(email_admin_router)
 app.include_router(plan_admin_router)
 app.include_router(worker_status_router)
 app.include_router(campaigns_router)
-app.include_router(campaign_router)
 app.include_router(dashboard_router)
 app.include_router(asaas_webhook_router)
-
+app.include_router(billing_router)

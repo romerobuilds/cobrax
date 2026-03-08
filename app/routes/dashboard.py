@@ -1,6 +1,5 @@
-#app/routes/dashboard.py
 from __future__ import annotations
-from app.models.billing_charge import BillingCharge
+
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from uuid import UUID
@@ -17,6 +16,7 @@ from app.models.company import Company
 from app.models.email_log import EmailLog
 from app.models.email_template import EmailTemplate
 from app.models.user import User
+from app.models.billing_charge import BillingCharge
 
 router = APIRouter(prefix="/empresas", tags=["Dashboard"])
 
@@ -42,7 +42,6 @@ def get_current_user(
     if not user_id:
         raise HTTPException(status_code=401, detail="Token sem 'sub'")
 
-    # User.id é UUID; token vem string
     try:
         user_uuid = UUID(str(user_id))
     except Exception:
@@ -57,6 +56,17 @@ def get_current_user(
     return user
 
 
+def _get_company_or_403(db: Session, company_id: str, user: User) -> Company:
+    company = db.query(Company).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Empresa não encontrada")
+
+    if str(company.owner_id) != str(user.id):
+        raise HTTPException(status_code=403, detail="Sem acesso a essa empresa")
+
+    return company
+
+
 @router.get("/{company_id}/dashboard/metrics")
 def dashboard_metrics(
     company_id: str,
@@ -67,18 +77,12 @@ def dashboard_metrics(
     """
     KPI + séries temporais + últimos eventos.
     """
-    company = db.query(Company).filter(Company.id == company_id).first()
-    if not company:
-        raise HTTPException(status_code=404, detail="Empresa não encontrada")
-
-    if str(company.owner_id) != str(user.id):
-        raise HTTPException(status_code=403, detail="Sem acesso a essa empresa")
+    company = _get_company_or_403(db, company_id, user)
 
     days = max(1, min(int(days or 30), 365))
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=days)
 
-    # ---------- KPIs básicos ----------
     total_clients = (
         db.query(func.count(Client.id))
         .filter(Client.company_id == company_id)
@@ -100,7 +104,6 @@ def dashboard_metrics(
         or 0
     )
 
-    # ---------- Logs no período ----------
     q_logs_period = db.query(EmailLog).filter(
         EmailLog.company_id == company_id,
         EmailLog.created_at >= since,
@@ -119,7 +122,6 @@ def dashboard_metrics(
     if (sent_period + failed_period) > 0:
         success_rate = round((sent_period / (sent_period + failed_period)) * 100.0, 2)
 
-    # ---------- Série por dia (SENT/FAILED) ----------
     rows = (
         db.query(
             cast(func.date_trunc("day", EmailLog.created_at), Date).label("day"),
@@ -151,14 +153,12 @@ def dashboard_metrics(
             "total": int(r.total or 0),
         }
 
-    # exatamente "days" dias
     series: List[Dict[str, Any]] = []
     for i in range(days - 1, -1, -1):
         d = (now - timedelta(days=i)).date().isoformat()
         v = series_map.get(d, {"sent": 0, "failed": 0, "total": 0})
         series.append({"date": d, **v})
 
-    # ---------- Últimas campanhas ----------
     recent_campaigns = (
         db.query(Campaign)
         .filter(Campaign.company_id == company_id)
@@ -183,7 +183,6 @@ def dashboard_metrics(
         for c in recent_campaigns
     ]
 
-    # ---------- Últimos envios ----------
     recent_logs = (
         db.query(EmailLog)
         .filter(EmailLog.company_id == company_id)
@@ -224,23 +223,21 @@ def dashboard_metrics(
         "updated_at": now.isoformat(),
     }
 
+
 @router.get("/{company_id}/dashboard/finance")
 def dashboard_finance(
     company_id: str,
+    limit: int = 10,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """
-    Métricas financeiras baseadas em billing_charges
+    Resumo financeiro do billing + últimas cobranças.
     """
+    _get_company_or_403(db, company_id, user)
 
-    company = db.query(Company).filter(Company.id == company_id).first()
-
-    if not company:
-        raise HTTPException(status_code=404, detail="Empresa não encontrada")
-
-    if str(company.owner_id) != str(user.id):
-        raise HTTPException(status_code=403, detail="Sem acesso a essa empresa")
+    limit = max(1, min(int(limit or 10), 50))
+    now = datetime.now(timezone.utc).date()
 
     total_emitido = (
         db.query(func.coalesce(func.sum(BillingCharge.value), 0))
@@ -253,7 +250,7 @@ def dashboard_finance(
         db.query(func.coalesce(func.sum(BillingCharge.value), 0))
         .filter(
             BillingCharge.company_id == company_id,
-            BillingCharge.status == "PAID",
+            func.upper(BillingCharge.status) == "PAID",
         )
         .scalar()
         or 0
@@ -263,7 +260,7 @@ def dashboard_finance(
         db.query(func.coalesce(func.sum(BillingCharge.value), 0))
         .filter(
             BillingCharge.company_id == company_id,
-            BillingCharge.status == "PENDING",
+            func.upper(BillingCharge.status) == "PENDING",
         )
         .scalar()
         or 0
@@ -273,23 +270,89 @@ def dashboard_finance(
         db.query(func.coalesce(func.sum(BillingCharge.value), 0))
         .filter(
             BillingCharge.company_id == company_id,
-            BillingCharge.status == "OVERDUE",
+            func.upper(BillingCharge.status) == "OVERDUE",
         )
         .scalar()
         or 0
     )
 
-    total_cobrancas = (
-        db.query(func.count(BillingCharge.id))
-        .filter(BillingCharge.company_id == company_id)
+    total_cancelado = (
+        db.query(func.coalesce(func.sum(BillingCharge.value), 0))
+        .filter(
+            BillingCharge.company_id == company_id,
+            func.upper(BillingCharge.status) == "CANCELLED",
+        )
         .scalar()
         or 0
     )
 
+    status_rows = (
+        db.query(
+            func.upper(BillingCharge.status).label("status"),
+            func.count(BillingCharge.id).label("count"),
+            func.coalesce(func.sum(BillingCharge.value), 0).label("amount"),
+        )
+        .filter(BillingCharge.company_id == company_id)
+        .group_by(func.upper(BillingCharge.status))
+        .order_by(func.upper(BillingCharge.status))
+        .all()
+    )
+
+    by_status = [
+        {
+            "status": str(r.status or ""),
+            "count": int(r.count or 0),
+            "amount": float(r.amount or 0),
+        }
+        for r in status_rows
+    ]
+
+    recent = (
+        db.query(BillingCharge, Client)
+        .outerjoin(Client, Client.id == BillingCharge.client_id)
+        .filter(BillingCharge.company_id == company_id)
+        .order_by(BillingCharge.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    recent_charges = []
+    for charge, client in recent:
+        due_date = charge.due_date.isoformat() if charge.due_date else None
+        overdue = bool(
+            charge.due_date
+            and charge.due_date < now
+            and str(charge.status).upper() not in ("PAID", "CANCELLED")
+        )
+
+        recent_charges.append(
+            {
+                "id": str(charge.id),
+                "campaign_id": str(charge.campaign_id) if charge.campaign_id else None,
+                "client_id": str(charge.client_id) if charge.client_id else None,
+                "client_nome": getattr(client, "nome", None) if client else None,
+                "client_email": getattr(client, "email", None) if client else None,
+                "asaas_payment_id": charge.asaas_payment_id,
+                "value": float(charge.value or 0),
+                "status": charge.status,
+                "due_date": due_date,
+                "invoice_url": charge.invoice_url,
+                "bank_slip_url": charge.bank_slip_url,
+                "created_at": charge.created_at.isoformat() if charge.created_at else None,
+                "paid_at": charge.paid_at.isoformat() if charge.paid_at else None,
+                "overdue": overdue,
+            }
+        )
+
     return {
-        "emitido": float(total_emitido),
-        "pago": float(total_pago),
-        "pendente": float(total_pendente),
-        "vencido": float(total_vencido),
-        "total_cobrancas": int(total_cobrancas),
+        "summary": {
+            "emitido": float(total_emitido),
+            "pago": float(total_pago),
+            "pendente": float(total_pendente),
+            "vencido": float(total_vencido),
+            "cancelado": float(total_cancelado),
+        },
+        "by_status": by_status,
+        "recent_charges": recent_charges,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }

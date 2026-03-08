@@ -1,5 +1,6 @@
+#app/routes/dashboard.py
 from __future__ import annotations
-
+from app.models.billing_charge import BillingCharge
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from uuid import UUID
@@ -221,4 +222,74 @@ def dashboard_metrics(
         "recent_campaigns": campaigns_out,
         "recent_sends": logs_out,
         "updated_at": now.isoformat(),
+    }
+
+@router.get("/{company_id}/dashboard/finance")
+def dashboard_finance(
+    company_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Métricas financeiras baseadas em billing_charges
+    """
+
+    company = db.query(Company).filter(Company.id == company_id).first()
+
+    if not company:
+        raise HTTPException(status_code=404, detail="Empresa não encontrada")
+
+    if str(company.owner_id) != str(user.id):
+        raise HTTPException(status_code=403, detail="Sem acesso a essa empresa")
+
+    total_emitido = (
+        db.query(func.coalesce(func.sum(BillingCharge.value), 0))
+        .filter(BillingCharge.company_id == company_id)
+        .scalar()
+        or 0
+    )
+
+    total_pago = (
+        db.query(func.coalesce(func.sum(BillingCharge.value), 0))
+        .filter(
+            BillingCharge.company_id == company_id,
+            BillingCharge.status == "PAID",
+        )
+        .scalar()
+        or 0
+    )
+
+    total_pendente = (
+        db.query(func.coalesce(func.sum(BillingCharge.value), 0))
+        .filter(
+            BillingCharge.company_id == company_id,
+            BillingCharge.status == "PENDING",
+        )
+        .scalar()
+        or 0
+    )
+
+    total_vencido = (
+        db.query(func.coalesce(func.sum(BillingCharge.value), 0))
+        .filter(
+            BillingCharge.company_id == company_id,
+            BillingCharge.status == "OVERDUE",
+        )
+        .scalar()
+        or 0
+    )
+
+    total_cobrancas = (
+        db.query(func.count(BillingCharge.id))
+        .filter(BillingCharge.company_id == company_id)
+        .scalar()
+        or 0
+    )
+
+    return {
+        "emitido": float(total_emitido),
+        "pago": float(total_pago),
+        "pendente": float(total_pendente),
+        "vencido": float(total_vencido),
+        "total_cobrancas": int(total_cobrancas),
     }

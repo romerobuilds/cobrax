@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.deps import get_current_user
@@ -40,6 +40,13 @@ def _money_to_str(v: Any) -> str:
         return "0.00"
 
 
+def _money_to_float(v: Any) -> float:
+    try:
+        return float(Decimal(str(v or 0)).quantize(Decimal("0.01")))
+    except Exception:
+        return 0.0
+
+
 def _serialize_charge(c: BillingCharge) -> Dict[str, Any]:
     client = getattr(c, "client", None)
     campaign = getattr(c, "campaign", None)
@@ -55,6 +62,7 @@ def _serialize_charge(c: BillingCharge) -> Dict[str, Any]:
         "asaas_customer_id": c.asaas_customer_id,
         "asaas_payment_id": c.asaas_payment_id,
         "value": _money_to_str(c.value),
+        "value_number": _money_to_float(c.value),
         "status": c.status,
         "due_date": c.due_date.isoformat() if c.due_date else None,
         "invoice_url": c.invoice_url,
@@ -62,6 +70,54 @@ def _serialize_charge(c: BillingCharge) -> Dict[str, Any]:
         "created_at": c.created_at.isoformat() if c.created_at else None,
         "paid_at": c.paid_at.isoformat() if c.paid_at else None,
         "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+        "is_paid": str(c.status or "").upper() == "PAID",
+        "is_overdue": str(c.status or "").upper() == "OVERDUE",
+    }
+
+
+def _build_summary(base_query) -> Dict[str, Any]:
+    rows = (
+        base_query.with_entities(
+            BillingCharge.status,
+            func.count(BillingCharge.id),
+            func.coalesce(func.sum(BillingCharge.value), 0),
+        )
+        .group_by(BillingCharge.status)
+        .all()
+    )
+
+    by_status: Dict[str, Dict[str, Any]] = {}
+    total_count = 0
+    total_value = Decimal("0.00")
+
+    for status, count, value_sum in rows:
+        st = str(status or "UNKNOWN").upper()
+        cnt = int(count or 0)
+        val = Decimal(str(value_sum or 0)).quantize(Decimal("0.01"))
+
+        by_status[st] = {
+            "count": cnt,
+            "value": f"{val}",
+            "value_number": float(val),
+        }
+
+        total_count += cnt
+        total_value += val
+
+    paid_count = int(by_status.get("PAID", {}).get("count", 0))
+    pending_count = int(by_status.get("PENDING", {}).get("count", 0))
+    overdue_count = int(by_status.get("OVERDUE", {}).get("count", 0))
+    cancelled_count = int(by_status.get("CANCELLED", {}).get("count", 0))
+
+    return {
+        "total_count": total_count,
+        "total_value": f"{total_value.quantize(Decimal('0.01'))}",
+        "total_value_number": float(total_value.quantize(Decimal("0.01"))),
+        "paid_count": paid_count,
+        "pending_count": pending_count,
+        "overdue_count": overdue_count,
+        "cancelled_count": cancelled_count,
+        "by_status": by_status,
     }
 
 
@@ -89,7 +145,7 @@ def list_billing_charges(
     )
 
     if status:
-        q = q.filter(BillingCharge.status == status.strip())
+        q = q.filter(BillingCharge.status == status.strip().upper())
 
     if campaign_id:
         q = q.filter(BillingCharge.campaign_id == campaign_id)
@@ -106,10 +162,15 @@ def list_billing_charges(
             )
         )
 
+    summary = _build_summary(q)
+
     total = q.count()
 
     items = (
-        q.order_by(BillingCharge.created_at.desc())
+        q.order_by(
+            BillingCharge.created_at.desc(),
+            BillingCharge.updated_at.desc(),
+        )
         .offset(offset)
         .limit(limit)
         .all()
@@ -120,6 +181,7 @@ def list_billing_charges(
         "total": int(total),
         "limit": int(limit),
         "offset": int(offset),
+        "summary": summary,
         "items": [_serialize_charge(c) for c in items],
     }
 

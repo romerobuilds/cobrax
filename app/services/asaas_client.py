@@ -25,7 +25,6 @@ def _asaas_headers() -> Dict[str, str]:
 
     user_agent = (os.getenv("ASAAS_USER_AGENT") or "COBRAX").strip()
 
-    # Asaas usa header "access_token"
     return {
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -59,7 +58,6 @@ def _sanitize_cpf_cnpj(value: Optional[str]) -> Optional[str]:
     s = re.sub(r"\D+", "", str(value).strip())
     if not s:
         return None
-    # CPF 11 / CNPJ 14
     if len(s) not in (11, 14):
         return None
     return s
@@ -148,7 +146,6 @@ def create_boleto_payment(
         "description": description,
     }
 
-    # ESSENCIAL pro seu webhook mapear e salvar no banco
     if external_reference:
         payload["externalReference"] = external_reference
 
@@ -162,12 +159,52 @@ def create_boleto_payment(
     return r.json() or {}
 
 
+def get_payment(payment_id: str) -> Dict[str, Any]:
+    """
+    Consulta um pagamento no Asaas pelo ID.
+    """
+    if not payment_id:
+        raise RuntimeError("payment_id é obrigatório")
+
+    base = _asaas_base_url()
+    headers = _asaas_headers()
+
+    r = requests.get(
+        f"{base}/payments/{payment_id}",
+        headers=headers,
+        timeout=20,
+    )
+    _raise_for_status_with_body(r)
+    return r.json() or {}
+
+
+def delete_payment(payment_id: str) -> Dict[str, Any]:
+    """
+    Remove/cancela uma cobrança no Asaas.
+    """
+    if not payment_id:
+        raise RuntimeError("payment_id é obrigatório")
+
+    base = _asaas_base_url()
+    headers = _asaas_headers()
+
+    r = requests.delete(
+        f"{base}/payments/{payment_id}",
+        headers=headers,
+        timeout=20,
+    )
+    _raise_for_status_with_body(r)
+    try:
+        return r.json() or {}
+    except Exception:
+        return {"ok": True}
+
+
 def _is_asaas_domain(url: str) -> bool:
     try:
         host = (urlparse(url).hostname or "").lower()
     except Exception:
         return False
-    # cobre: api.asaas.com, sandbox.asaas.com, www.asaas.com, asaas.com
     return host.endswith("asaas.com")
 
 
@@ -176,8 +213,8 @@ def download_url_as_bytes(url: str, timeout: int = 25) -> Tuple[bytes, str]:
     Baixa um URL e retorna (bytes, content_type).
 
     Importante:
-    - Se o URL for do Asaas, envia também o access_token (alguns endpoints exigem).
-    - Se NÃO for Asaas, NÃO envia token (evita vazamento).
+    - Se o URL for do Asaas, envia também o access_token.
+    - Se não for Asaas, não envia token.
     """
     if not url:
         raise RuntimeError("URL vazio para download")
@@ -185,7 +222,6 @@ def download_url_as_bytes(url: str, timeout: int = 25) -> Tuple[bytes, str]:
     user_agent = (os.getenv("ASAAS_USER_AGENT") or "COBRAX").strip()
     headers: Dict[str, str] = {"User-Agent": user_agent}
 
-    # Só manda token pra domínio Asaas
     if _is_asaas_domain(url):
         api_key = (os.getenv("ASAAS_API_KEY") or "").strip()
         if api_key:

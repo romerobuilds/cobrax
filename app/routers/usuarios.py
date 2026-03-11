@@ -106,10 +106,26 @@ def list_company_users(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    if not user.is_master:
-        raise HTTPException(status_code=403, detail="Apenas usuários master podem listar usuários")
+    company = db.query(Company).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Empresa não encontrada")
 
-    _get_company_owned_by_master_or_404(db, company_id, user)
+    if user.is_master:
+        if str(company.owner_id) != str(user.id):
+            raise HTTPException(status_code=403, detail="Sem acesso a esta empresa")
+    else:
+        membership = (
+            db.query(CompanyUser)
+            .filter(
+                CompanyUser.company_id == company_id,
+                CompanyUser.user_id == user.id,
+                CompanyUser.is_active.is_(True),
+                CompanyUser.role == "company_admin",
+            )
+            .first()
+        )
+        if not membership:
+            raise HTTPException(status_code=403, detail="Sem permissão para listar usuários")
 
     rows = (
         db.query(CompanyUser, User)
@@ -145,10 +161,26 @@ def create_company_user(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    if not user.is_master:
-        raise HTTPException(status_code=403, detail="Apenas usuários master podem criar usuários")
+    company = db.query(Company).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Empresa não encontrada")
 
-    _get_company_owned_by_master_or_404(db, company_id, user)
+    if user.is_master:
+        if str(company.owner_id) != str(user.id):
+            raise HTTPException(status_code=403, detail="Sem acesso a esta empresa")
+    else:
+        membership = (
+            db.query(CompanyUser)
+            .filter(
+                CompanyUser.company_id == company_id,
+                CompanyUser.user_id == user.id,
+                CompanyUser.is_active.is_(True),
+                CompanyUser.role == "company_admin",
+            )
+            .first()
+        )
+        if not membership:
+            raise HTTPException(status_code=403, detail="Sem permissão para criar usuários")
 
     existing_user = db.query(User).filter(User.email == payload.email).first()
     if existing_user:

@@ -1,10 +1,16 @@
-from pydantic import BaseModel, EmailStr
 from uuid import UUID
+from pydantic import BaseModel, EmailStr, Field
+
 
 class CompanyCreate(BaseModel):
     nome: str
     cnpj: str
-    email: str
+    email: EmailStr
+
+    initial_user_nome: str = Field(min_length=2, max_length=120)
+    initial_user_email: EmailStr
+    initial_user_senha: str = Field(min_length=6, max_length=72)
+
 
 class CompanyOut(BaseModel):
     id: str
@@ -13,8 +19,8 @@ class CompanyOut(BaseModel):
     email: str
 
     class Config:
-        from_attributes = True  # Pydantic v2
-# usado para responder ao client (saída)
+        from_attributes = True
+
 
 class CompanyPublic(BaseModel):
     id: UUID
@@ -24,4 +30,4 @@ class CompanyPublic(BaseModel):
     owner_id: UUID
 
     class Config:
-        from_attributes = True  # SQLAlchemy → Pydantic (obrigatório)
+        from_attributes = True

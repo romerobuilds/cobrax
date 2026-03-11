@@ -19,7 +19,11 @@ class Company(Base):
 
     owner_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
 
-    owner = relationship("User", back_populates="companies")
+    owner = relationship(
+        "User",
+        back_populates="companies",
+        foreign_keys=[owner_id],
+    )
 
     smtp_host = Column(String, nullable=True)
     smtp_port = Column(Integer, nullable=True)

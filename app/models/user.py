@@ -17,7 +17,6 @@ class User(Base):
 
     is_master = Column(Boolean, nullable=False, default=True)
 
-    # Empresa-base do master (ex.: Cobrax)
     home_company_id = Column(UUID(as_uuid=True), ForeignKey("companies.id"), nullable=True)
 
     companies = relationship(

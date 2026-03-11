@@ -11,30 +11,12 @@ from sqlalchemy.orm import Session
 router = APIRouter(tags=["Health"])
 
 # =========================
-# AUTH / ME
-# =========================
-
-@router.get("/me")
-def me(user: User = Depends(get_current_user)):
-    return {
-        "id": str(user.id),
-        "email": user.email,
-        "nome": user.nome,
-    }
-
-# =========================
 # HEALTHCHECKS
 # =========================
 
 @router.get("/health")
-def health_check():
-    """
-    Liveness probe — só diz se a API está no ar.
-    """
-    return {
-        "status": "ok",
-        "service": "cobrax",
-    }
+def health():
+    return {"ok": True, "service": "cobrax"}
 
 
 @router.get("/health/deps")

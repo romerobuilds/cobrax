@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import os
+
+from fastapi import APIRouter, Depends, HTTPException, status, Body
 from sqlalchemy.orm import Session
 from uuid import UUID
 
@@ -10,6 +12,14 @@ from app.core.security import hash_senha
 from app.models.company import Company
 from app.models.company_user import CompanyUser
 from app.models.user import User
+from app.models.client import Client
+from app.models.email_template import EmailTemplate
+from app.models.email_log import EmailLog
+from app.models.billing_charge import BillingCharge
+from app.models.campaign import Campaign
+from app.models.campaign_run import CampaignRun
+from app.models.campaign_target import CampaignTarget
+
 from app.schemas.company import CompanyCreate, CompanyPublic
 from app.schemas.company_smtp_settings import (
     CompanySmtpSettingsOut,
@@ -91,7 +101,6 @@ def criar_empresa(
         email=payload.email,
         owner_id=user.id,
     )
-
     db.add(empresa)
     db.flush()
 
@@ -114,7 +123,6 @@ def criar_empresa(
 
     db.commit()
     db.refresh(empresa)
-
     return empresa
 
 
@@ -126,22 +134,32 @@ def minhas_empresas(
     return db.query(Company).filter(Company.owner_id == user.id).all()
 
 
-@router.delete(
-    "/{company_id}",
-    status_code=status.HTTP_200_OK,
-)
+@router.delete("/{company_id}", status_code=status.HTTP_200_OK)
 def delete_company(
     company_id: UUID,
+    body: dict = Body(default_factory=dict),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     company = _get_company_or_404(db, company_id, user.id)
 
+    master_delete_key = (os.getenv("MASTER_DELETE_KEY") or "").strip()
+    provided_key = str(body.get("master_key") or "").strip()
+
+    if not master_delete_key:
+        raise HTTPException(
+            status_code=500,
+            detail="MASTER_DELETE_KEY não configurada no servidor",
+        )
+
+    if provided_key != master_delete_key:
+        raise HTTPException(status_code=403, detail="Chave master inválida")
+
     if user.home_company_id and str(company.id) == str(user.home_company_id):
-      raise HTTPException(
-          status_code=400,
-          detail="A empresa principal master não pode ser excluída",
-      )
+        raise HTTPException(
+            status_code=400,
+            detail="A empresa principal master não pode ser excluída",
+        )
 
     if str(company.nome or "").strip().lower() == "cobrax":
         raise HTTPException(
@@ -149,21 +167,60 @@ def delete_company(
             detail="A empresa principal master não pode ser excluída",
         )
 
+    # usuários vinculados à empresa antes de apagar vínculos
     memberships = db.query(CompanyUser).filter(CompanyUser.company_id == company.id).all()
+    linked_user_ids = [m.user_id for m in memberships]
 
-    for membership in memberships:
-        user_obj = db.query(User).filter(User.id == membership.user_id).first()
-        db.delete(membership)
-        if user_obj and not user_obj.is_master:
-            remaining = (
+    # 1) billing charges
+    db.query(BillingCharge).filter(BillingCharge.company_id == company.id).delete(synchronize_session=False)
+
+    # 2) email logs
+    db.query(EmailLog).filter(EmailLog.company_id == company.id).delete(synchronize_session=False)
+
+    # 3) campaign targets e runs
+    campaign_ids = [
+        row[0]
+        for row in db.query(Campaign.id).filter(Campaign.company_id == company.id).all()
+    ]
+
+    if campaign_ids:
+        db.query(CampaignTarget).filter(CampaignTarget.campaign_id.in_(campaign_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(CampaignRun).filter(CampaignRun.campaign_id.in_(campaign_ids)).delete(
+            synchronize_session=False
+        )
+
+    # 4) campaigns
+    db.query(Campaign).filter(Campaign.company_id == company.id).delete(synchronize_session=False)
+
+    # 5) clients
+    db.query(Client).filter(Client.company_id == company.id).delete(synchronize_session=False)
+
+    # 6) templates
+    db.query(EmailTemplate).filter(EmailTemplate.company_id == company.id).delete(synchronize_session=False)
+
+    # 7) memberships
+    db.query(CompanyUser).filter(CompanyUser.company_id == company.id).delete(synchronize_session=False)
+
+    # 8) apagar usuários não-master que só existiam nessa empresa
+    if linked_user_ids:
+        for user_id in linked_user_ids:
+            user_obj = db.query(User).filter(User.id == user_id).first()
+            if not user_obj or user_obj.is_master:
+                continue
+
+            remaining_memberships = (
                 db.query(CompanyUser)
-                .filter(CompanyUser.user_id == user_obj.id)
+                .filter(CompanyUser.user_id == user_id)
                 .count()
             )
-            if remaining <= 1:
+            if remaining_memberships == 0:
                 db.delete(user_obj)
 
+    # 9) company
     db.delete(company)
+
     db.commit()
 
     return {

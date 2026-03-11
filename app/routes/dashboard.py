@@ -5,18 +5,18 @@ from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from sqlalchemy import Date, cast, case, func
+from sqlalchemy import Date, and_, cast, case, func, or_
 from sqlalchemy.orm import Session
 
 from app.core.jwt import verificar_token
 from app.database_.database import get_db
+from app.models.billing_charge import BillingCharge
 from app.models.campaign import Campaign
 from app.models.client import Client
 from app.models.company import Company
 from app.models.email_log import EmailLog
 from app.models.email_template import EmailTemplate
 from app.models.user import User
-from app.models.billing_charge import BillingCharge
 
 router = APIRouter(prefix="/empresas", tags=["Dashboard"])
 
@@ -25,9 +25,6 @@ def get_current_user(
     db: Session = Depends(get_db),
     authorization: Optional[str] = Header(default=None),
 ) -> User:
-    """
-    Lê Authorization: Bearer <token>, decodifica e busca o usuário no banco.
-    """
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
 
@@ -45,9 +42,7 @@ def get_current_user(
     try:
         user_uuid = UUID(str(user_id))
     except Exception:
-        raise HTTPException(
-            status_code=401, detail="Token 'sub' inválido (UUID esperado)"
-        )
+        raise HTTPException(status_code=401, detail="Token 'sub' inválido (UUID esperado)")
 
     user = db.query(User).filter(User.id == user_uuid).first()
     if not user:
@@ -67,6 +62,21 @@ def _get_company_or_403(db: Session, company_id: str, user: User) -> Company:
     return company
 
 
+def _normalize_billing_status(status: Optional[str], due_date, today) -> str:
+    s = str(status or "").upper().strip()
+
+    if s in {"RECEIVED", "CONFIRMED"}:
+        return "PAID"
+
+    if s in {"REFUNDED", "REFUND_REQUESTED"}:
+        return "CANCELLED"
+
+    if s not in {"PAID", "CANCELLED"} and due_date and due_date < today:
+        return "OVERDUE"
+
+    return s or "PENDING"
+
+
 @router.get("/{company_id}/dashboard/metrics")
 def dashboard_metrics(
     company_id: str,
@@ -74,9 +84,6 @@ def dashboard_metrics(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """
-    KPI + séries temporais + últimos eventos.
-    """
     company = _get_company_or_403(db, company_id, user)
 
     days = max(1, min(int(days or 30), 365))
@@ -131,6 +138,9 @@ def dashboard_metrics(
             func.sum(
                 case((func.upper(EmailLog.status) == "FAILED", 1), else_=0)
             ).label("failed"),
+            func.sum(
+                case((func.upper(EmailLog.status).notin_(["SENT", "FAILED"]), 1), else_=0)
+            ).label("pending"),
             func.count(EmailLog.id).label("total"),
         )
         .filter(
@@ -150,13 +160,14 @@ def dashboard_metrics(
         series_map[key] = {
             "sent": int(r.sent or 0),
             "failed": int(r.failed or 0),
+            "pending": int(r.pending or 0),
             "total": int(r.total or 0),
         }
 
     series: List[Dict[str, Any]] = []
     for i in range(days - 1, -1, -1):
         d = (now - timedelta(days=i)).date().isoformat()
-        v = series_map.get(d, {"sent": 0, "failed": 0, "total": 0})
+        v = series_map.get(d, {"sent": 0, "failed": 0, "pending": 0, "total": 0})
         series.append({"date": d, **v})
 
     recent_campaigns = (
@@ -174,11 +185,9 @@ def dashboard_metrics(
             "status": c.status,
             "mode": getattr(c, "mode", None),
             "rate_per_min": getattr(c, "rate_per_min", None),
-            "template_id": str(c.template_id),
+            "template_id": str(c.template_id) if getattr(c, "template_id", None) else None,
             "created_at": c.created_at.isoformat() if c.created_at else None,
-            "next_run_at": c.next_run_at.isoformat()
-            if getattr(c, "next_run_at", None)
-            else None,
+            "next_run_at": c.next_run_at.isoformat() if getattr(c, "next_run_at", None) else None,
         }
         for c in recent_campaigns
     ]
@@ -231,99 +240,59 @@ def dashboard_finance(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """
-    Resumo financeiro do billing + últimas cobranças.
-    """
     _get_company_or_403(db, company_id, user)
 
     limit = max(1, min(int(limit or 10), 50))
-    now = datetime.now(timezone.utc).date()
+    today = datetime.now(timezone.utc).date()
 
-    total_emitido = (
-        db.query(func.coalesce(func.sum(BillingCharge.value), 0))
-        .filter(BillingCharge.company_id == company_id)
-        .scalar()
-        or 0
-    )
-
-    total_pago = (
-        db.query(func.coalesce(func.sum(BillingCharge.value), 0))
-        .filter(
-            BillingCharge.company_id == company_id,
-            func.upper(BillingCharge.status) == "PAID",
-        )
-        .scalar()
-        or 0
-    )
-
-    total_pendente = (
-        db.query(func.coalesce(func.sum(BillingCharge.value), 0))
-        .filter(
-            BillingCharge.company_id == company_id,
-            func.upper(BillingCharge.status) == "PENDING",
-        )
-        .scalar()
-        or 0
-    )
-
-    total_vencido = (
-        db.query(func.coalesce(func.sum(BillingCharge.value), 0))
-        .filter(
-            BillingCharge.company_id == company_id,
-            func.upper(BillingCharge.status) == "OVERDUE",
-        )
-        .scalar()
-        or 0
-    )
-
-    total_cancelado = (
-        db.query(func.coalesce(func.sum(BillingCharge.value), 0))
-        .filter(
-            BillingCharge.company_id == company_id,
-            func.upper(BillingCharge.status) == "CANCELLED",
-        )
-        .scalar()
-        or 0
-    )
-
-    status_rows = (
-        db.query(
-            func.upper(BillingCharge.status).label("status"),
-            func.count(BillingCharge.id).label("count"),
-            func.coalesce(func.sum(BillingCharge.value), 0).label("amount"),
-        )
-        .filter(BillingCharge.company_id == company_id)
-        .group_by(func.upper(BillingCharge.status))
-        .order_by(func.upper(BillingCharge.status))
-        .all()
-    )
-
-    by_status = [
-        {
-            "status": str(r.status or ""),
-            "count": int(r.count or 0),
-            "amount": float(r.amount or 0),
-        }
-        for r in status_rows
-    ]
-
-    recent = (
+    charges = (
         db.query(BillingCharge, Client)
         .outerjoin(Client, Client.id == BillingCharge.client_id)
         .filter(BillingCharge.company_id == company_id)
         .order_by(BillingCharge.created_at.desc())
-        .limit(limit)
         .all()
     )
 
+    emitido = 0.0
+    pago = 0.0
+    pendente = 0.0
+    vencido = 0.0
+    cancelado = 0.0
+
+    by_status_map: Dict[str, Dict[str, Any]] = {}
+
     recent_charges = []
+
+    for charge, client in charges:
+        value = float(charge.value or 0)
+        normalized_status = _normalize_billing_status(charge.status, charge.due_date, today)
+
+        emitido += value
+
+        if normalized_status == "PAID":
+          pago += value
+        elif normalized_status == "PENDING":
+          pendente += value
+        elif normalized_status == "OVERDUE":
+          vencido += value
+        elif normalized_status == "CANCELLED":
+          cancelado += value
+
+        if normalized_status not in by_status_map:
+            by_status_map[normalized_status] = {
+                "status": normalized_status,
+                "count": 0,
+                "amount": 0.0,
+            }
+
+        by_status_map[normalized_status]["count"] += 1
+        by_status_map[normalized_status]["amount"] += value
+
+    recent = charges[:limit]
+
     for charge, client in recent:
-        due_date = charge.due_date.isoformat() if charge.due_date else None
-        overdue = bool(
-            charge.due_date
-            and charge.due_date < now
-            and str(charge.status).upper() not in ("PAID", "CANCELLED")
-        )
+        normalized_status = _normalize_billing_status(charge.status, charge.due_date, today)
+        overdue = normalized_status == "OVERDUE"
 
         recent_charges.append(
             {
@@ -334,8 +303,8 @@ def dashboard_finance(
                 "client_email": getattr(client, "email", None) if client else None,
                 "asaas_payment_id": charge.asaas_payment_id,
                 "value": float(charge.value or 0),
-                "status": charge.status,
-                "due_date": due_date,
+                "status": normalized_status,
+                "due_date": charge.due_date.isoformat() if charge.due_date else None,
                 "invoice_url": charge.invoice_url,
                 "bank_slip_url": charge.bank_slip_url,
                 "created_at": charge.created_at.isoformat() if charge.created_at else None,
@@ -344,13 +313,19 @@ def dashboard_finance(
             }
         )
 
+    status_order = {"PAID": 0, "PENDING": 1, "OVERDUE": 2, "CANCELLED": 3}
+    by_status = sorted(
+        list(by_status_map.values()),
+        key=lambda item: status_order.get(item["status"], 99)
+    )
+
     return {
         "summary": {
-            "emitido": float(total_emitido),
-            "pago": float(total_pago),
-            "pendente": float(total_pendente),
-            "vencido": float(total_vencido),
-            "cancelado": float(total_cancelado),
+            "emitido": round(float(emitido), 2),
+            "pago": round(float(pago), 2),
+            "pendente": round(float(pendente), 2),
+            "vencido": round(float(vencido), 2),
+            "cancelado": round(float(cancelado), 2),
         },
         "by_status": by_status,
         "recent_charges": recent_charges,

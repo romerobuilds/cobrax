@@ -22,31 +22,14 @@ from app.services.mailer import send_smtp_email
 router = APIRouter(prefix="/empresas", tags=["Empresas"])
 
 
-def _get_company_or_404(db: Session, company_id: UUID, user: User) -> Company:
-    if user.is_master:
-        company = (
-            db.query(Company)
-            .filter(Company.id == company_id, Company.owner_id == user.id)
-            .first()
-        )
-    else:
-        membership = (
-            db.query(CompanyUser)
-            .filter(
-                CompanyUser.company_id == company_id,
-                CompanyUser.user_id == user.id,
-                CompanyUser.is_active.is_(True),
-            )
-            .first()
-        )
-        if not membership:
-            company = None
-        else:
-            company = db.query(Company).filter(Company.id == company_id).first()
-
+def _get_company_or_404(db: Session, company_id: UUID, user_id: UUID) -> Company:
+    company = (
+        db.query(Company)
+        .filter(Company.id == company_id, Company.owner_id == user_id)
+        .first()
+    )
     if not company:
         raise HTTPException(status_code=404, detail="Empresa não encontrada")
-
     return company
 
 
@@ -80,34 +63,42 @@ def criar_empresa(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    if not user.is_master:
-        raise HTTPException(status_code=403, detail="Apenas usuários master podem criar empresas")
-
-    existe_empresa = (
+    existe = (
         db.query(Company)
         .filter((Company.cnpj == payload.cnpj) | (Company.email == payload.email))
         .first()
     )
-    if existe_empresa:
+    if existe:
         raise HTTPException(status_code=400, detail="Empresa já existe (cnpj/email)")
 
-    existe_user = db.query(User).filter(User.email == payload.initial_user_email).first()
-    if existe_user:
-        raise HTTPException(status_code=400, detail="Já existe usuário com o e-mail inicial informado")
+    if not payload.initial_user_nome or not payload.initial_user_email or not payload.initial_user_senha:
+        raise HTTPException(
+            status_code=400,
+            detail="Informe nome, e-mail e senha do usuário inicial da empresa",
+        )
+
+    existing_user = (
+        db.query(User)
+        .filter(User.email == payload.initial_user_email.strip().lower())
+        .first()
+    )
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Já existe um usuário com este e-mail")
 
     empresa = Company(
         nome=payload.nome,
         cnpj=payload.cnpj,
-        email=str(payload.email).strip().lower(),
+        email=payload.email,
         owner_id=user.id,
     )
+
     db.add(empresa)
     db.flush()
 
     initial_user = User(
         nome=payload.initial_user_nome.strip(),
-        email=str(payload.initial_user_email).strip().lower(),
-        senha_hash=hash_senha(payload.initial_user_senha),
+        email=payload.initial_user_email.strip().lower(),
+        senha_hash=hash_senha(payload.initial_user_senha.strip()),
         is_master=False,
     )
     db.add(initial_user)
@@ -132,33 +123,53 @@ def minhas_empresas(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    if user.is_master:
-        return (
-            db.query(Company)
-            .filter(Company.owner_id == user.id)
-            .order_by(Company.nome.asc())
-            .all()
+    return db.query(Company).filter(Company.owner_id == user.id).all()
+
+
+@router.delete(
+    "/{company_id}",
+    status_code=status.HTTP_200_OK,
+)
+def delete_company(
+    company_id: UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    company = _get_company_or_404(db, company_id, user.id)
+
+    if user.home_company_id and str(company.id) == str(user.home_company_id):
+      raise HTTPException(
+          status_code=400,
+          detail="A empresa principal master não pode ser excluída",
+      )
+
+    if str(company.nome or "").strip().lower() == "cobrax":
+        raise HTTPException(
+            status_code=400,
+            detail="A empresa principal master não pode ser excluída",
         )
 
-    memberships = (
-        db.query(CompanyUser.company_id)
-        .filter(
-            CompanyUser.user_id == user.id,
-            CompanyUser.is_active.is_(True),
-        )
-        .all()
-    )
-    company_ids = [m.company_id for m in memberships]
+    memberships = db.query(CompanyUser).filter(CompanyUser.company_id == company.id).all()
 
-    if not company_ids:
-        return []
+    for membership in memberships:
+        user_obj = db.query(User).filter(User.id == membership.user_id).first()
+        db.delete(membership)
+        if user_obj and not user_obj.is_master:
+            remaining = (
+                db.query(CompanyUser)
+                .filter(CompanyUser.user_id == user_obj.id)
+                .count()
+            )
+            if remaining <= 1:
+                db.delete(user_obj)
 
-    return (
-        db.query(Company)
-        .filter(Company.id.in_(company_ids))
-        .order_by(Company.nome.asc())
-        .all()
-    )
+    db.delete(company)
+    db.commit()
+
+    return {
+        "ok": True,
+        "message": "Empresa excluída com sucesso",
+    }
 
 
 @router.get(
@@ -171,7 +182,7 @@ def get_smtp_settings(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    company = _get_company_or_404(db, company_id, user)
+    company = _get_company_or_404(db, company_id, user.id)
     return _smtp_out(company)
 
 
@@ -186,7 +197,7 @@ def put_smtp_settings(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    company = _get_company_or_404(db, company_id, user)
+    company = _get_company_or_404(db, company_id, user.id)
 
     if payload.smtp_host is not None:
         company.smtp_host = payload.smtp_host.strip() or None
@@ -228,7 +239,7 @@ def test_smtp_settings(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    company = _get_company_or_404(db, company_id, user)
+    company = _get_company_or_404(db, company_id, user.id)
 
     if not company.smtp_host:
         raise HTTPException(status_code=400, detail="Configure o servidor de envio antes do teste")
@@ -302,7 +313,7 @@ def update_email_admin_settings(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    company = _get_company_or_404(db, company_id, user)
+    company = _get_company_or_404(db, company_id, user.id)
 
     if payload.rate_per_min is not None and payload.rate_per_min not in {5, 10, 15, 20, 25, 30}:
         raise HTTPException(

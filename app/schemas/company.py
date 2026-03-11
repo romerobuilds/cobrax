@@ -1,15 +1,15 @@
+from pydantic import BaseModel, EmailStr
 from uuid import UUID
-from pydantic import BaseModel, EmailStr, Field
 
 
 class CompanyCreate(BaseModel):
     nome: str
     cnpj: str
-    email: EmailStr
+    email: str
 
-    initial_user_nome: str = Field(min_length=2, max_length=120)
+    initial_user_nome: str
     initial_user_email: EmailStr
-    initial_user_senha: str = Field(min_length=6, max_length=72)
+    initial_user_senha: str
 
 
 class CompanyOut(BaseModel):

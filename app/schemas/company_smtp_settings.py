@@ -11,7 +11,6 @@ class CompanySmtpSettingsUpdate(BaseModel):
     smtp_user: Optional[str] = None
     smtp_password: Optional[str] = None
     smtp_use_tls: Optional[bool] = True
-
     from_email: Optional[EmailStr] = None
     from_name: Optional[str] = Field(default=None, max_length=120)
 

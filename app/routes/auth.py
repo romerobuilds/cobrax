@@ -13,14 +13,7 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 
 @router.post("/register", response_model=UserPublic, status_code=201)
 def register(payload: UserCreate, db: Session = Depends(get_db)):
-
-    # ===== DEBUG (PASSO 1) =====
     senha = payload.senha
-    print("======= DEBUG REGISTER =======")
-    print("SENHA (início):", repr(senha[:20]))
-    print("LEN (chars):", len(senha))
-    print("LEN (bytes):", len(senha.encode("utf-8")))
-    print("==============================")
 
     existe = db.query(User).filter(User.email == payload.email).first()
     if existe:
@@ -30,6 +23,7 @@ def register(payload: UserCreate, db: Session = Depends(get_db)):
         email=payload.email,
         nome=payload.nome,
         senha_hash=hash_senha(senha),
+        is_master=True,  # ✅ mantém compatibilidade com o que já existe hoje
     )
 
     db.add(user)
@@ -39,7 +33,8 @@ def register(payload: UserCreate, db: Session = Depends(get_db)):
     return UserPublic(
         id=user.id,
         email=user.email,
-        nome=user.nome
+        nome=user.nome,
+        is_master=user.is_master,
     )
 
 
@@ -56,5 +51,10 @@ def login(
             detail="Credenciais inválidas"
         )
 
-    token = criar_token({"sub": str(user.id), "email": user.email})
+    token = criar_token({
+        "sub": str(user.id),
+        "email": user.email,
+        "is_master": bool(user.is_master),
+    })
+
     return Token(access_token=token)

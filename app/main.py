@@ -9,6 +9,7 @@ from app.models.client import Client
 from app.models.email_template import EmailTemplate
 from app.models.email_log import EmailLog
 from app.models.billing_charge import BillingCharge
+from app.models.company_user import CompanyUser
 
 from app.models import user, company, client, email_template
 
@@ -29,6 +30,7 @@ from app.routes.email_admin import router as email_admin_router
 from app.routes.plan_admin import router as plan_admin_router
 from app.routes.worker_status import router as worker_status_router
 from app.routes.dashboard import router as dashboard_router
+
 
 app = FastAPI(
     title="COBRAX",

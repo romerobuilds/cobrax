@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import Boolean, Column, String
+from sqlalchemy import Boolean, Column, ForeignKey, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -15,14 +15,16 @@ class User(Base):
     nome = Column(String, nullable=False)
     senha_hash = Column(String, nullable=False)
 
-    # 🔐 Todos os usuários atuais continuam master por padrão,
-    # para não quebrar o sistema atual.
     is_master = Column(Boolean, nullable=False, default=True)
+
+    # Empresa-base do master (ex.: Cobrax)
+    home_company_id = Column(UUID(as_uuid=True), ForeignKey("companies.id"), nullable=True)
 
     companies = relationship(
         "Company",
         back_populates="owner",
         cascade="all, delete-orphan",
+        foreign_keys="Company.owner_id",
     )
 
     clients = relationship(
@@ -35,4 +37,10 @@ class User(Base):
         "CompanyUser",
         back_populates="user",
         cascade="all, delete-orphan",
+    )
+
+    home_company = relationship(
+        "Company",
+        foreign_keys=[home_company_id],
+        post_update=True,
     )

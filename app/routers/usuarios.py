@@ -24,6 +24,10 @@ class CompanyUserCreateIn(BaseModel):
     role: str = "company_admin"
 
 
+class SetHomeCompanyIn(BaseModel):
+    company_id: UUID
+
+
 def _get_company_owned_by_master_or_404(db: Session, company_id: UUID, user: User) -> Company:
     company = (
         db.query(Company)
@@ -76,6 +80,32 @@ def _build_accessible_companies(db: Session, user: User) -> list[AccessibleCompa
     ]
 
 
+def _resolve_master_home_company_id(db: Session, user: User, companies: list[AccessibleCompany]) -> str | None:
+    if not user.is_master:
+        return None
+
+    if user.home_company_id:
+        return str(user.home_company_id)
+
+    company_ids = {c.id for c in companies}
+    if not company_ids:
+        return None
+
+    # prioridade 1: empresa chamada Cobrax
+    cobrax = (
+        db.query(Company)
+        .filter(Company.owner_id == user.id)
+        .filter(Company.nome.ilike("cobrax"))
+        .order_by(Company.nome.asc())
+        .first()
+    )
+    if cobrax and str(cobrax.id) in company_ids:
+        return str(cobrax.id)
+
+    # prioridade 2: primeira empresa acessível
+    return companies[0].id if companies else None
+
+
 @router.get("/me", response_model=MeResponse, tags=["Auth"])
 def me(
     db: Session = Depends(get_db),
@@ -85,6 +115,7 @@ def me(
 
     profile_type = "master" if user.is_master else "company"
     locked_company_id = None if user.is_master else (companies[0].id if companies else None)
+    home_company_id = _resolve_master_home_company_id(db, user, companies)
 
     return MeResponse(
         id=str(user.id),
@@ -93,8 +124,36 @@ def me(
         is_master=bool(user.is_master),
         profile_type=profile_type,
         locked_company_id=locked_company_id,
+        home_company_id=home_company_id,
         accessible_companies=companies,
     )
+
+
+@router.post(
+    "/me/home-company",
+    status_code=status.HTTP_200_OK,
+    tags=["Auth"],
+)
+def set_home_company(
+    payload: SetHomeCompanyIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if not user.is_master:
+        raise HTTPException(status_code=403, detail="Apenas usuários master podem definir empresa-base")
+
+    company = _get_company_owned_by_master_or_404(db, payload.company_id, user)
+
+    user.home_company_id = company.id
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "ok": True,
+        "home_company_id": str(user.home_company_id),
+        "company_name": company.nome,
+    }
 
 
 @router.get(

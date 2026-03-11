@@ -36,4 +36,5 @@ class MeResponse(BaseModel):
     is_master: bool
     profile_type: str
     locked_company_id: str | None = None
+    home_company_id: str | None = None
     accessible_companies: list[AccessibleCompany] = []

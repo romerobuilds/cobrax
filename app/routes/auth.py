@@ -23,7 +23,7 @@ def register(payload: UserCreate, db: Session = Depends(get_db)):
         email=payload.email,
         nome=payload.nome,
         senha_hash=hash_senha(senha),
-        is_master=True,  # ✅ mantém compatibilidade com o que já existe hoje
+        is_master=True,
     )
 
     db.add(user)
@@ -55,6 +55,7 @@ def login(
         "sub": str(user.id),
         "email": user.email,
         "is_master": bool(user.is_master),
+        "home_company_id": str(user.home_company_id) if user.home_company_id else None,
     })
 
     return Token(access_token=token)

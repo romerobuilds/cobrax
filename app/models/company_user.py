@@ -19,6 +19,7 @@ class CompanyUser(Base):
 
     role = Column(String, nullable=False, default="company_admin")
     is_active = Column(Boolean, nullable=False, default=True)
+    is_primary = Column(Boolean, nullable=False, default=False)
 
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 

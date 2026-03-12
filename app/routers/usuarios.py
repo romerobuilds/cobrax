@@ -24,6 +24,12 @@ class CompanyUserCreateIn(BaseModel):
     role: str = "company_admin"
 
 
+class CompanyUserUpdateIn(BaseModel):
+    nome: str = Field(min_length=2, max_length=120)
+    email: EmailStr
+    is_active: bool | None = None
+
+
 class SetHomeCompanyIn(BaseModel):
     company_id: UUID
 
@@ -140,6 +146,32 @@ def _resolve_master_home_company_id(
     return companies[0].id if companies else None
 
 
+def _ensure_company_access(db: Session, company_id: UUID, user: User) -> Company:
+    company = db.query(Company).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Empresa não encontrada")
+
+    accessible_ids = {c.id for c in _build_accessible_companies(db, user)}
+    if str(company_id) not in accessible_ids:
+        raise HTTPException(status_code=403, detail="Sem acesso a esta empresa")
+
+    return company
+
+
+def _get_membership_or_404(db: Session, company_id: UUID, user_id: UUID) -> CompanyUser:
+    membership = (
+        db.query(CompanyUser)
+        .filter(
+            CompanyUser.company_id == company_id,
+            CompanyUser.user_id == user_id,
+        )
+        .first()
+    )
+    if not membership:
+        raise HTTPException(status_code=404, detail="Vínculo do usuário com a empresa não encontrado")
+    return membership
+
+
 @router.get("/me", response_model=MeResponse, tags=["Auth"])
 def me(
     db: Session = Depends(get_db),
@@ -205,13 +237,7 @@ def list_company_users(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    company = db.query(Company).filter(Company.id == company_id).first()
-    if not company:
-        raise HTTPException(status_code=404, detail="Empresa não encontrada")
-
-    accessible_ids = {c.id for c in _build_accessible_companies(db, user)}
-    if str(company_id) not in accessible_ids:
-        raise HTTPException(status_code=403, detail="Sem acesso a esta empresa")
+    _ensure_company_access(db, company_id, user)
 
     base_query = (
         db.query(CompanyUser, User)
@@ -231,14 +257,14 @@ def list_company_users(
             rows = (
                 base_query
                 .filter(User.is_master.is_(True))
-                .order_by(User.nome.asc())
+                .order_by(CompanyUser.is_primary.desc(), User.nome.asc())
                 .all()
             )
         else:
             rows = (
                 base_query
                 .filter(User.is_master.is_(False))
-                .order_by(User.nome.asc())
+                .order_by(CompanyUser.is_primary.desc(), User.nome.asc())
                 .all()
             )
     else:
@@ -257,7 +283,7 @@ def list_company_users(
         rows = (
             base_query
             .filter(User.is_master.is_(False))
-            .order_by(User.nome.asc())
+            .order_by(CompanyUser.is_primary.desc(), User.nome.asc())
             .all()
         )
 
@@ -271,6 +297,7 @@ def list_company_users(
                 "role": membership.role,
                 "is_active": bool(membership.is_active),
                 "is_master": bool(user_obj.is_master),
+                "is_primary": bool(membership.is_primary),
                 "created_at": membership.created_at.isoformat() if membership.created_at else None,
             }
             for membership, user_obj in rows
@@ -288,34 +315,14 @@ def create_company_user(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    company = db.query(Company).filter(Company.id == company_id).first()
-    if not company:
-        raise HTTPException(status_code=404, detail="Empresa não encontrada")
-
-    accessible = _build_accessible_companies(db, user)
-    accessible_ids = {c.id for c in accessible}
-
-    if str(company_id) not in accessible_ids:
-        raise HTTPException(status_code=403, detail="Sem acesso a esta empresa")
-
-    if not user.is_master:
-        membership = (
-            db.query(CompanyUser)
-            .filter(
-                CompanyUser.company_id == company_id,
-                CompanyUser.user_id == user.id,
-                CompanyUser.is_active.is_(True),
-            )
-            .first()
-        )
-        if not membership:
-            raise HTTPException(status_code=403, detail="Sem permissão para criar usuários")
+    company = _ensure_company_access(db, company_id, user)
 
     normalized_email = str(payload.email).strip().lower()
     existing_user = db.query(User).filter(User.email == normalized_email).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="Já existe um usuário com este e-mail")
 
+    accessible = _build_accessible_companies(db, user)
     creator_home_company_id = (
         _resolve_master_home_company_id(db, user, accessible) if user.is_master else None
     )
@@ -338,7 +345,6 @@ def create_company_user(
 
     if is_creating_from_master_base:
         target_company_ids = [UUID(c.id) for c in accessible if c.id]
-
         if not target_company_ids:
             target_company_ids = [company_id]
 
@@ -349,6 +355,7 @@ def create_company_user(
                     user_id=new_user.id,
                     role="master",
                     is_active=True,
+                    is_primary=False,
                 )
             )
     else:
@@ -358,6 +365,7 @@ def create_company_user(
                 user_id=new_user.id,
                 role=(payload.role or "company_admin").strip() or "company_admin",
                 is_active=True,
+                is_primary=False,
             )
         )
 
@@ -374,6 +382,117 @@ def create_company_user(
             "role": "master" if new_user.is_master else ((payload.role or "company_admin").strip() or "company_admin"),
             "is_active": True,
             "is_master": bool(new_user.is_master),
+            "is_primary": False,
             "home_company_id": str(new_user.home_company_id) if new_user.home_company_id else None,
         },
+    }
+
+
+@router.patch(
+    "/empresas/{company_id}/usuarios/{user_id}",
+    status_code=status.HTTP_200_OK,
+)
+def update_company_user(
+    company_id: UUID,
+    user_id: UUID,
+    payload: CompanyUserUpdateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _ensure_company_access(db, company_id, user)
+
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+
+    membership = _get_membership_or_404(db, company_id, user_id)
+
+    if membership.is_primary and payload.is_active is False:
+        raise HTTPException(
+            status_code=400,
+            detail="O usuário inicial da empresa não pode ser desativado.",
+        )
+
+    normalized_email = str(payload.email).strip().lower()
+    existing_email_user = (
+        db.query(User)
+        .filter(User.email == normalized_email, User.id != user_id)
+        .first()
+    )
+    if existing_email_user:
+        raise HTTPException(status_code=400, detail="Já existe um usuário com este e-mail")
+
+    target_user.nome = payload.nome.strip()
+    target_user.email = normalized_email
+
+    if payload.is_active is not None:
+        membership.is_active = bool(payload.is_active)
+
+    db.add(target_user)
+    db.add(membership)
+    db.commit()
+    db.refresh(target_user)
+    db.refresh(membership)
+
+    return {
+        "message": "Usuário atualizado com sucesso",
+        "usuario": {
+            "membership_id": str(membership.id),
+            "user_id": str(target_user.id),
+            "nome": target_user.nome,
+            "email": target_user.email,
+            "role": membership.role,
+            "is_active": bool(membership.is_active),
+            "is_master": bool(target_user.is_master),
+            "is_primary": bool(membership.is_primary),
+        },
+    }
+
+
+@router.delete(
+    "/empresas/{company_id}/usuarios/{user_id}",
+    status_code=status.HTTP_200_OK,
+)
+def delete_company_user(
+    company_id: UUID,
+    user_id: UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _ensure_company_access(db, company_id, user)
+
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+
+    membership = _get_membership_or_404(db, company_id, user_id)
+
+    if membership.is_primary:
+        raise HTTPException(
+            status_code=400,
+            detail="O usuário inicial da empresa não pode ser excluído.",
+        )
+
+    if str(target_user.id) == str(user.id):
+        raise HTTPException(
+            status_code=400,
+            detail="Você não pode excluir o seu próprio usuário por esta tela.",
+        )
+
+    db.delete(membership)
+
+    remaining_memberships = (
+        db.query(CompanyUser)
+        .filter(CompanyUser.user_id == user_id, CompanyUser.id != membership.id)
+        .count()
+    )
+
+    if remaining_memberships == 0:
+        db.delete(target_user)
+
+    db.commit()
+
+    return {
+        "ok": True,
+        "message": "Usuário excluído com sucesso",
     }

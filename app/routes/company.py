@@ -151,6 +151,7 @@ def criar_empresa(
                 user_id=new_user.id,
                 role="company_admin",
                 is_active=True,
+                is_primary=True,
             )
         )
 

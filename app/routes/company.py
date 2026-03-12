@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import os
-
-from fastapi import APIRouter, Depends, HTTPException, status, Body
-from sqlalchemy.orm import Session
 from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
 
 from app.database_.database import get_db
 from app.core.deps import get_current_user
@@ -13,13 +12,7 @@ from app.models.company import Company
 from app.models.company_user import CompanyUser
 from app.models.user import User
 from app.models.client import Client
-from app.models.email_template import EmailTemplate
-from app.models.email_log import EmailLog
 from app.models.billing_charge import BillingCharge
-from app.models.campaign import Campaign
-from app.models.campaign_run import CampaignRun
-from app.models.campaign_target import CampaignTarget
-
 from app.schemas.company import CompanyCreate, CompanyPublic
 from app.schemas.company_smtp_settings import (
     CompanySmtpSettingsOut,
@@ -31,15 +24,51 @@ from app.services.mailer import send_smtp_email
 
 router = APIRouter(prefix="/empresas", tags=["Empresas"])
 
+MASTER_DELETE_KEY = "An@ly2904"
 
-def _get_company_or_404(db: Session, company_id: UUID, user_id: UUID) -> Company:
-    company = (
-        db.query(Company)
-        .filter(Company.id == company_id, Company.owner_id == user_id)
-        .first()
-    )
+
+def _master_accessible_company_ids(db: Session, user: User) -> set[str]:
+    owned_ids = {
+        str(row[0])
+        for row in db.query(Company.id).filter(Company.owner_id == user.id).all()
+    }
+
+    membership_ids = {
+        str(row[0])
+        for row in db.query(CompanyUser.company_id)
+        .filter(
+            CompanyUser.user_id == user.id,
+            CompanyUser.is_active.is_(True),
+        )
+        .all()
+    }
+
+    return owned_ids | membership_ids
+
+
+def _get_company_or_404(db: Session, company_id: UUID, user: User) -> Company:
+    company = db.query(Company).filter(Company.id == company_id).first()
     if not company:
         raise HTTPException(status_code=404, detail="Empresa não encontrada")
+
+    if user.is_master:
+        allowed_ids = _master_accessible_company_ids(db, user)
+        if str(company.id) not in allowed_ids:
+            raise HTTPException(status_code=403, detail="Sem acesso a esta empresa")
+        return company
+
+    membership = (
+        db.query(CompanyUser)
+        .filter(
+            CompanyUser.company_id == company_id,
+            CompanyUser.user_id == user.id,
+            CompanyUser.is_active.is_(True),
+        )
+        .first()
+    )
+    if not membership:
+        raise HTTPException(status_code=403, detail="Sem acesso a esta empresa")
+
     return company
 
 
@@ -73,6 +102,9 @@ def criar_empresa(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    if not user.is_master:
+        raise HTTPException(status_code=403, detail="Apenas master pode criar empresas")
+
     existe = (
         db.query(Company)
         .filter((Company.cnpj == payload.cnpj) | (Company.email == payload.email))
@@ -81,45 +113,46 @@ def criar_empresa(
     if existe:
         raise HTTPException(status_code=400, detail="Empresa já existe (cnpj/email)")
 
-    if not payload.initial_user_nome or not payload.initial_user_email or not payload.initial_user_senha:
-        raise HTTPException(
-            status_code=400,
-            detail="Informe nome, e-mail e senha do usuário inicial da empresa",
-        )
-
-    existing_user = (
-        db.query(User)
-        .filter(User.email == payload.initial_user_email.strip().lower())
-        .first()
-    )
-    if existing_user:
-        raise HTTPException(status_code=400, detail="Já existe um usuário com este e-mail")
-
     empresa = Company(
         nome=payload.nome,
         cnpj=payload.cnpj,
         email=payload.email,
         owner_id=user.id,
     )
+
     db.add(empresa)
     db.flush()
 
-    initial_user = User(
-        nome=payload.initial_user_nome.strip(),
-        email=payload.initial_user_email.strip().lower(),
-        senha_hash=hash_senha(payload.initial_user_senha.strip()),
-        is_master=False,
-    )
-    db.add(initial_user)
-    db.flush()
+    initial_user_nome = getattr(payload, "initial_user_nome", None)
+    initial_user_email = getattr(payload, "initial_user_email", None)
+    initial_user_senha = getattr(payload, "initial_user_senha", None)
 
-    membership = CompanyUser(
-        company_id=empresa.id,
-        user_id=initial_user.id,
-        role="company_admin",
-        is_active=True,
-    )
-    db.add(membership)
+    if initial_user_nome and initial_user_email and initial_user_senha:
+        existing_user = (
+            db.query(User)
+            .filter(User.email == str(initial_user_email).strip().lower())
+            .first()
+        )
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Já existe usuário com este e-mail")
+
+        new_user = User(
+            nome=str(initial_user_nome).strip(),
+            email=str(initial_user_email).strip().lower(),
+            senha_hash=hash_senha(str(initial_user_senha)),
+            is_master=False,
+        )
+        db.add(new_user)
+        db.flush()
+
+        db.add(
+            CompanyUser(
+                company_id=empresa.id,
+                user_id=new_user.id,
+                role="company_admin",
+                is_active=True,
+            )
+        )
 
     db.commit()
     db.refresh(empresa)
@@ -131,102 +164,37 @@ def minhas_empresas(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    return db.query(Company).filter(Company.owner_id == user.id).all()
+    if user.is_master:
+        allowed_ids = _master_accessible_company_ids(db, user)
+        if not allowed_ids:
+            return []
 
-
-@router.delete("/{company_id}", status_code=status.HTTP_200_OK)
-def delete_company(
-    company_id: UUID,
-    body: dict = Body(default_factory=dict),
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    company = _get_company_or_404(db, company_id, user.id)
-
-    master_delete_key = (os.getenv("MASTER_DELETE_KEY") or "").strip()
-    provided_key = str(body.get("master_key") or "").strip()
-
-    if not master_delete_key:
-        raise HTTPException(
-            status_code=500,
-            detail="MASTER_DELETE_KEY não configurada no servidor",
+        return (
+            db.query(Company)
+            .filter(Company.id.in_([UUID(x) for x in allowed_ids]))
+            .order_by(Company.nome.asc())
+            .all()
         )
 
-    if provided_key != master_delete_key:
-        raise HTTPException(status_code=403, detail="Chave master inválida")
-
-    if user.home_company_id and str(company.id) == str(user.home_company_id):
-        raise HTTPException(
-            status_code=400,
-            detail="A empresa principal master não pode ser excluída",
-        )
-
-    if str(company.nome or "").strip().lower() == "cobrax":
-        raise HTTPException(
-            status_code=400,
-            detail="A empresa principal master não pode ser excluída",
-        )
-
-    # usuários vinculados à empresa antes de apagar vínculos
-    memberships = db.query(CompanyUser).filter(CompanyUser.company_id == company.id).all()
-    linked_user_ids = [m.user_id for m in memberships]
-
-    # 1) billing charges
-    db.query(BillingCharge).filter(BillingCharge.company_id == company.id).delete(synchronize_session=False)
-
-    # 2) email logs
-    db.query(EmailLog).filter(EmailLog.company_id == company.id).delete(synchronize_session=False)
-
-    # 3) campaign targets e runs
-    campaign_ids = [
+    membership_ids = [
         row[0]
-        for row in db.query(Campaign.id).filter(Campaign.company_id == company.id).all()
+        for row in db.query(CompanyUser.company_id)
+        .filter(
+            CompanyUser.user_id == user.id,
+            CompanyUser.is_active.is_(True),
+        )
+        .all()
     ]
 
-    if campaign_ids:
-        db.query(CampaignTarget).filter(CampaignTarget.campaign_id.in_(campaign_ids)).delete(
-            synchronize_session=False
-        )
-        db.query(CampaignRun).filter(CampaignRun.campaign_id.in_(campaign_ids)).delete(
-            synchronize_session=False
-        )
+    if not membership_ids:
+        return []
 
-    # 4) campaigns
-    db.query(Campaign).filter(Campaign.company_id == company.id).delete(synchronize_session=False)
-
-    # 5) clients
-    db.query(Client).filter(Client.company_id == company.id).delete(synchronize_session=False)
-
-    # 6) templates
-    db.query(EmailTemplate).filter(EmailTemplate.company_id == company.id).delete(synchronize_session=False)
-
-    # 7) memberships
-    db.query(CompanyUser).filter(CompanyUser.company_id == company.id).delete(synchronize_session=False)
-
-    # 8) apagar usuários não-master que só existiam nessa empresa
-    if linked_user_ids:
-        for user_id in linked_user_ids:
-            user_obj = db.query(User).filter(User.id == user_id).first()
-            if not user_obj or user_obj.is_master:
-                continue
-
-            remaining_memberships = (
-                db.query(CompanyUser)
-                .filter(CompanyUser.user_id == user_id)
-                .count()
-            )
-            if remaining_memberships == 0:
-                db.delete(user_obj)
-
-    # 9) company
-    db.delete(company)
-
-    db.commit()
-
-    return {
-        "ok": True,
-        "message": "Empresa excluída com sucesso",
-    }
+    return (
+        db.query(Company)
+        .filter(Company.id.in_(membership_ids))
+        .order_by(Company.nome.asc())
+        .all()
+    )
 
 
 @router.get(
@@ -239,7 +207,7 @@ def get_smtp_settings(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    company = _get_company_or_404(db, company_id, user.id)
+    company = _get_company_or_404(db, company_id, user)
     return _smtp_out(company)
 
 
@@ -254,7 +222,7 @@ def put_smtp_settings(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    company = _get_company_or_404(db, company_id, user.id)
+    company = _get_company_or_404(db, company_id, user)
 
     if payload.smtp_host is not None:
         company.smtp_host = payload.smtp_host.strip() or None
@@ -296,7 +264,7 @@ def test_smtp_settings(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    company = _get_company_or_404(db, company_id, user.id)
+    company = _get_company_or_404(db, company_id, user)
 
     if not company.smtp_host:
         raise HTTPException(status_code=400, detail="Configure o servidor de envio antes do teste")
@@ -370,7 +338,7 @@ def update_email_admin_settings(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    company = _get_company_or_404(db, company_id, user.id)
+    company = _get_company_or_404(db, company_id, user)
 
     if payload.rate_per_min is not None and payload.rate_per_min not in {5, 10, 15, 20, 25, 30}:
         raise HTTPException(
@@ -398,4 +366,62 @@ def update_email_admin_settings(
         "smtp_paused": bool(company.smtp_paused),
         "daily_email_limit": company.daily_email_limit,
         "rate_per_min": int(company.rate_per_min),
+    }
+
+
+@router.delete(
+    "/{company_id}",
+    status_code=status.HTTP_200_OK,
+)
+def delete_company(
+    company_id: UUID,
+    master_key: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if not user.is_master:
+        raise HTTPException(status_code=403, detail="Apenas master pode excluir empresas")
+
+    if master_key != MASTER_DELETE_KEY:
+        raise HTTPException(status_code=403, detail="Chave master inválida")
+
+    company = db.query(Company).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Empresa não encontrada")
+
+    if str(company.nome or "").strip().lower() == "cobrax":
+        raise HTTPException(status_code=400, detail="A empresa principal Cobrax não pode ser excluída")
+
+    allowed_ids = _master_accessible_company_ids(db, user)
+    if str(company.id) not in allowed_ids:
+        raise HTTPException(status_code=403, detail="Sem acesso a esta empresa")
+
+    client_ids = [
+        row[0]
+        for row in db.query(Client.id).filter(Client.company_id == company.id).all()
+    ]
+
+    if client_ids:
+        db.query(BillingCharge).filter(BillingCharge.client_id.in_(client_ids)).delete(
+            synchronize_session=False
+        )
+
+    db.query(BillingCharge).filter(BillingCharge.company_id == company.id).delete(
+        synchronize_session=False
+    )
+
+    db.query(CompanyUser).filter(CompanyUser.company_id == company.id).delete(
+        synchronize_session=False
+    )
+
+    db.query(Client).filter(Client.company_id == company.id).delete(
+        synchronize_session=False
+    )
+
+    db.delete(company)
+    db.commit()
+
+    return {
+        "ok": True,
+        "message": "Empresa excluída com sucesso",
     }

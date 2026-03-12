@@ -225,13 +225,30 @@ def list_company_users(
         if not has_access:
             raise HTTPException(status_code=403, detail="Sem acesso a esta empresa")
 
-        rows = (
-            db.query(CompanyUser, User)
-            .join(User, User.id == CompanyUser.user_id)
-            .filter(CompanyUser.company_id == company_id)
-            .order_by(User.nome.asc())
-            .all()
+        is_master_base = bool(
+            user.home_company_id and str(user.home_company_id) == str(company_id)
         )
+
+        if is_master_base:
+            rows = (
+                db.query(CompanyUser, User)
+                .join(User, User.id == CompanyUser.user_id)
+                .filter(CompanyUser.company_id == company_id)
+                .order_by(User.nome.asc())
+                .all()
+            )
+        else:
+            rows = (
+                db.query(CompanyUser, User)
+                .join(User, User.id == CompanyUser.user_id)
+                .filter(
+                    CompanyUser.company_id == company_id,
+                    User.is_master.is_(False),
+                )
+                .order_by(User.nome.asc())
+                .all()
+            )
+
     else:
         membership = (
             db.query(CompanyUser)
@@ -250,7 +267,7 @@ def list_company_users(
             .join(User, User.id == CompanyUser.user_id)
             .filter(
                 CompanyUser.company_id == company_id,
-                User.is_master.is_(False),  # <- esconde masters do ambiente do cliente
+                User.is_master.is_(False),
             )
             .order_by(User.nome.asc())
             .all()

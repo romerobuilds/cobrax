@@ -28,7 +28,11 @@ class SetHomeCompanyIn(BaseModel):
     company_id: UUID
 
 
-def _get_company_owned_by_master_or_404(db: Session, company_id: UUID, user: User) -> Company:
+def _get_company_owned_by_master_or_404(
+    db: Session,
+    company_id: UUID,
+    user: User,
+) -> Company:
     company = (
         db.query(Company)
         .filter(Company.id == company_id, Company.owner_id == user.id)
@@ -43,7 +47,7 @@ def _build_accessible_companies(db: Session, user: User) -> list[AccessibleCompa
     """
     Master:
       - vê empresas que possui
-      - ou, se for master de suporte, vê empresas onde foi vinculado com role master
+      - e empresas onde foi vinculado com membership ativo
 
     Company user:
       - vê apenas empresas onde possui membership ativo
@@ -205,50 +209,38 @@ def list_company_users(
     if not company:
         raise HTTPException(status_code=404, detail="Empresa não encontrada")
 
+    accessible_ids = {c.id for c in _build_accessible_companies(db, user)}
+    if str(company_id) not in accessible_ids:
+        raise HTTPException(status_code=403, detail="Sem acesso a esta empresa")
+
+    base_query = (
+        db.query(CompanyUser, User)
+        .join(User, User.id == CompanyUser.user_id)
+        .filter(
+            CompanyUser.company_id == company_id,
+            CompanyUser.is_active.is_(True),
+        )
+    )
+
     if user.is_master:
-        has_access = False
-
-        if str(company.owner_id) == str(user.id):
-            has_access = True
-        else:
-            membership = (
-                db.query(CompanyUser)
-                .filter(
-                    CompanyUser.company_id == company_id,
-                    CompanyUser.user_id == user.id,
-                    CompanyUser.is_active.is_(True),
-                )
-                .first()
-            )
-            has_access = membership is not None
-
-        if not has_access:
-            raise HTTPException(status_code=403, detail="Sem acesso a esta empresa")
-
         is_master_base = bool(
             user.home_company_id and str(user.home_company_id) == str(company_id)
         )
 
         if is_master_base:
             rows = (
-                db.query(CompanyUser, User)
-                .join(User, User.id == CompanyUser.user_id)
-                .filter(CompanyUser.company_id == company_id)
+                base_query
+                .filter(User.is_master.is_(True))
                 .order_by(User.nome.asc())
                 .all()
             )
         else:
             rows = (
-                db.query(CompanyUser, User)
-                .join(User, User.id == CompanyUser.user_id)
-                .filter(
-                    CompanyUser.company_id == company_id,
-                    User.is_master.is_(False),
-                )
+                base_query
+                .filter(User.is_master.is_(False))
                 .order_by(User.nome.asc())
                 .all()
             )
-
     else:
         membership = (
             db.query(CompanyUser)
@@ -263,12 +255,8 @@ def list_company_users(
             raise HTTPException(status_code=403, detail="Sem permissão para listar usuários")
 
         rows = (
-            db.query(CompanyUser, User)
-            .join(User, User.id == CompanyUser.user_id)
-            .filter(
-                CompanyUser.company_id == company_id,
-                User.is_master.is_(False),
-            )
+            base_query
+            .filter(User.is_master.is_(False))
             .order_by(User.nome.asc())
             .all()
         )
@@ -282,6 +270,7 @@ def list_company_users(
                 "email": user_obj.email,
                 "role": membership.role,
                 "is_active": bool(membership.is_active),
+                "is_master": bool(user_obj.is_master),
                 "created_at": membership.created_at.isoformat() if membership.created_at else None,
             }
             for membership, user_obj in rows
@@ -306,7 +295,7 @@ def create_company_user(
     accessible = _build_accessible_companies(db, user)
     accessible_ids = {c.id for c in accessible}
 
-    if str(company_id) not in accessible_ids and not user.is_master:
+    if str(company_id) not in accessible_ids:
         raise HTTPException(status_code=403, detail="Sem acesso a esta empresa")
 
     if not user.is_master:
@@ -316,18 +305,21 @@ def create_company_user(
                 CompanyUser.company_id == company_id,
                 CompanyUser.user_id == user.id,
                 CompanyUser.is_active.is_(True),
-                CompanyUser.role == "company_admin",
             )
             .first()
         )
         if not membership:
             raise HTTPException(status_code=403, detail="Sem permissão para criar usuários")
 
-    existing_user = db.query(User).filter(User.email == str(payload.email).strip().lower()).first()
+    normalized_email = str(payload.email).strip().lower()
+    existing_user = db.query(User).filter(User.email == normalized_email).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="Já existe um usuário com este e-mail")
 
-    creator_home_company_id = _resolve_master_home_company_id(db, user, accessible) if user.is_master else None
+    creator_home_company_id = (
+        _resolve_master_home_company_id(db, user, accessible) if user.is_master else None
+    )
+
     is_creating_from_master_base = bool(
         user.is_master
         and creator_home_company_id
@@ -336,7 +328,7 @@ def create_company_user(
 
     new_user = User(
         nome=payload.nome.strip(),
-        email=str(payload.email).strip().lower(),
+        email=normalized_email,
         senha_hash=hash_senha(payload.senha),
         is_master=bool(is_creating_from_master_base),
         home_company_id=UUID(str(creator_home_company_id)) if is_creating_from_master_base else None,
@@ -345,26 +337,15 @@ def create_company_user(
     db.flush()
 
     if is_creating_from_master_base:
-        # Usuário nasce master e já recebe acesso a todas as empresas do ecossistema do master atual
-        master_companies = (
-            db.query(Company)
-            .join(CompanyUser, CompanyUser.company_id == Company.id, isouter=True)
-            .filter(
-                (Company.owner_id == user.id) |
-                (Company.id.in_([UUID(c.id) for c in accessible if c.id]))
-            )
-            .distinct()
-            .order_by(Company.nome.asc())
-            .all()
-        )
+        target_company_ids = [UUID(c.id) for c in accessible if c.id]
 
-        if not master_companies:
-            master_companies = [company]
+        if not target_company_ids:
+            target_company_ids = [company_id]
 
-        for target_company in master_companies:
+        for target_company_id in target_company_ids:
             db.add(
                 CompanyUser(
-                    company_id=target_company.id,
+                    company_id=target_company_id,
                     user_id=new_user.id,
                     role="master",
                     is_active=True,

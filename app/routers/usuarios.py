@@ -206,9 +206,32 @@ def list_company_users(
         raise HTTPException(status_code=404, detail="Empresa não encontrada")
 
     if user.is_master:
-        allowed_ids = {c.id for c in _build_accessible_companies(db, user)}
-        if str(company_id) not in allowed_ids:
+        has_access = False
+
+        if str(company.owner_id) == str(user.id):
+            has_access = True
+        else:
+            membership = (
+                db.query(CompanyUser)
+                .filter(
+                    CompanyUser.company_id == company_id,
+                    CompanyUser.user_id == user.id,
+                    CompanyUser.is_active.is_(True),
+                )
+                .first()
+            )
+            has_access = membership is not None
+
+        if not has_access:
             raise HTTPException(status_code=403, detail="Sem acesso a esta empresa")
+
+        rows = (
+            db.query(CompanyUser, User)
+            .join(User, User.id == CompanyUser.user_id)
+            .filter(CompanyUser.company_id == company_id)
+            .order_by(User.nome.asc())
+            .all()
+        )
     else:
         membership = (
             db.query(CompanyUser)
@@ -216,20 +239,22 @@ def list_company_users(
                 CompanyUser.company_id == company_id,
                 CompanyUser.user_id == user.id,
                 CompanyUser.is_active.is_(True),
-                CompanyUser.role == "company_admin",
             )
             .first()
         )
         if not membership:
             raise HTTPException(status_code=403, detail="Sem permissão para listar usuários")
 
-    rows = (
-        db.query(CompanyUser, User)
-        .join(User, User.id == CompanyUser.user_id)
-        .filter(CompanyUser.company_id == company_id)
-        .order_by(User.nome.asc())
-        .all()
-    )
+        rows = (
+            db.query(CompanyUser, User)
+            .join(User, User.id == CompanyUser.user_id)
+            .filter(
+                CompanyUser.company_id == company_id,
+                User.is_master.is_(False),  # <- esconde masters do ambiente do cliente
+            )
+            .order_by(User.nome.asc())
+            .all()
+        )
 
     return {
         "items": [
@@ -240,7 +265,6 @@ def list_company_users(
                 "email": user_obj.email,
                 "role": membership.role,
                 "is_active": bool(membership.is_active),
-                "is_master": bool(user_obj.is_master),
                 "created_at": membership.created_at.isoformat() if membership.created_at else None,
             }
             for membership, user_obj in rows

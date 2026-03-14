@@ -1,11 +1,12 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from uuid import UUID
-from pydantic import BaseModel
+
+from pydantic import BaseModel, Field
 
 
 class EmailSendRequest(BaseModel):
     client_id: UUID
-    context: Dict[str, Any] = {}  # variáveis extras, ex: {"valor":"200", "vencimento":"..."}
+    context: Dict[str, Any] = Field(default_factory=dict)
 
 
 class EmailSendResponse(BaseModel):

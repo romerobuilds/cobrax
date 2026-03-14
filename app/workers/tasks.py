@@ -9,14 +9,18 @@ from celery.exceptions import Retry
 
 from app.workers.celery_app import celery_app
 from app.database_.database import SessionLocal
+
 from app.models.email_log import EmailLog
 from app.models.company import Company
 from app.models.plan import Plan
-from app.workers.rate_limiter import throttle_company
-
+from app.models.user import User
+from app.models.company_user import CompanyUser
+from app.models.client import Client
+from app.models.billing_charge import BillingCharge
 from app.models.campaign import Campaign
 from app.models.campaign_run import CampaignRun
 
+from app.workers.rate_limiter import throttle_company
 from app.services.mailer import send_smtp_email, EmailAttachment
 from app.services.asaas_client import download_url_as_bytes
 
@@ -139,7 +143,6 @@ def send_email_job(self, log_id: str):
             _safe_update_totals_after_status_change(db, log)
             return
 
-        # campanha pausada?
         if getattr(log, "campaign_id", None):
             camp = db.query(Campaign).filter(Campaign.id == log.campaign_id).first()
             if camp and camp.status == "paused":
@@ -216,7 +219,6 @@ def send_email_job(self, log_id: str):
         log.attempt_count = (log.attempt_count or 0) + 1
         log.last_attempt_at = now
         log.status = "SENDING"
-        # não apaga error_message aqui (pode ter info útil), mas podemos limpar:
         log.error_message = None
         db.commit()
         _safe_update_totals_after_status_change(db, log)
@@ -227,7 +229,6 @@ def send_email_job(self, log_id: str):
         if getattr(log, "cancelled_at", None) is not None or log.status == "CANCELLED":
             return
 
-        # campanha pausada (depois)
         if getattr(log, "campaign_id", None):
             camp = db.query(Campaign).filter(Campaign.id == log.campaign_id).first()
             if camp and camp.status == "paused":
@@ -244,16 +245,12 @@ def send_email_job(self, log_id: str):
             _safe_update_totals_after_status_change(db, log)
             return
 
-        # =========================
-        # HTML + TEXTO + ANEXOS
-        # =========================
         body = log.body_rendered or ""
         body_html = body if _looks_like_html(body) else None
         body_text = _strip_html_simple(body) if body_html else body
 
         attachments: list[EmailAttachment] = []
 
-        # ✅ Só anexa se a regra mandou anexar (calculada lá na criação do EmailLog)
         if bool(getattr(log, "should_attach_pdf", False)):
             boleto_url = (getattr(log, "asaas_bank_slip_url", None) or "").strip()
             if boleto_url:
@@ -271,11 +268,9 @@ def send_email_job(self, log_id: str):
                             )
                         )
                     else:
-                        # não falha envio, só registra o motivo
                         log.error_message = f"URL do boleto não retornou PDF (content-type={content_type})"
                         db.commit()
                 except Exception as e:
-                    # não falha o envio por causa do anexo
                     log.error_message = f"Falha ao baixar/anexar boleto: {e}"
                     db.commit()
             else:

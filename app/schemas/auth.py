@@ -26,6 +26,7 @@ class AccessibleCompany(BaseModel):
     id: str
     nome: str
     email: str | None = None
+    cnpj: str | None = None
     role: str
 
 

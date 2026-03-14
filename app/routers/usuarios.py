@@ -84,6 +84,7 @@ def _build_accessible_companies(db: Session, user: User) -> list[AccessibleCompa
                 id=str(c.id),
                 nome=c.nome,
                 email=c.email,
+                cnpj=c.cnpj,
                 role="master",
             )
 
@@ -92,6 +93,7 @@ def _build_accessible_companies(db: Session, user: User) -> list[AccessibleCompa
                 id=str(company.id),
                 nome=company.nome,
                 email=company.email,
+                cnpj=company.cnpj,
                 role=membership.role or "master",
             )
 
@@ -113,6 +115,7 @@ def _build_accessible_companies(db: Session, user: User) -> list[AccessibleCompa
             id=str(company.id),
             nome=company.nome,
             email=company.email,
+            cnpj=company.cnpj,
             role=membership.role,
         )
         for membership, company in memberships

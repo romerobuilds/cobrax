@@ -1,46 +1,32 @@
 # app/routes/email_template.py
-from typing import List, Any, Dict
+from typing import List
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, get_company_for_current_user
 from app.database_.database import get_db
 from app.models.company import Company
 from app.models.email_template import EmailTemplate
 from app.models.user import User
-from app.models.client import Client  # <-- NOVO
+from app.models.client import Client
 
 from app.schemas.email_template import (
     EmailTemplateCreate,
     EmailTemplatePublic,
     EmailTemplateUpdate,
 )
-
-# --- NOVOS schemas (você vai criar em app/schemas/template_preview.py) ---
-from app.schemas.template_preview import TemplatePreviewRequest, TemplatePreviewResponse  # <-- NOVO
-
-# --- NOVOS serviços (você vai criar) ---
-from app.core.template_vars import build_default_context  # <-- NOVO
-from app.services.template_renderer import render_email_template  # <-- NOVO
+from app.schemas.template_preview import TemplatePreviewRequest, TemplatePreviewResponse
+from app.core.template_vars import build_default_context
+from app.services.template_renderer import render_email_template
 
 
 router = APIRouter(
     prefix="/empresas/{company_id}/templates",
     tags=["Templates"],
+    dependencies=[Depends(get_company_for_current_user)],
 )
-
-
-def _get_company_or_404(db: Session, company_id: UUID, user: User) -> Company:
-    company = (
-        db.query(Company)
-        .filter(Company.id == company_id, Company.owner_id == user.id)
-        .first()
-    )
-    if not company:
-        raise HTTPException(status_code=404, detail="Empresa não encontrada")
-    return company
 
 
 @router.post(
@@ -54,9 +40,6 @@ def criar_template(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user)
-
-    # Evita duplicados por nome dentro da mesma empresa (opcional mas útil)
     existe = (
         db.query(EmailTemplate)
         .filter(EmailTemplate.company_id == company_id, EmailTemplate.nome == payload.nome)
@@ -82,10 +65,7 @@ def criar_template(
 def listar_templates(
     company_id: UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user)
-
     return (
         db.query(EmailTemplate)
         .filter(EmailTemplate.company_id == company_id)
@@ -99,10 +79,7 @@ def obter_template(
     company_id: UUID,
     template_id: UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user)
-
     template = (
         db.query(EmailTemplate)
         .filter(EmailTemplate.id == template_id, EmailTemplate.company_id == company_id)
@@ -119,10 +96,7 @@ def atualizar_template(
     template_id: UUID,
     payload: EmailTemplateUpdate,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user)
-
     template = (
         db.query(EmailTemplate)
         .filter(EmailTemplate.id == template_id, EmailTemplate.company_id == company_id)
@@ -150,10 +124,7 @@ def deletar_template(
     company_id: UUID,
     template_id: UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user)
-
     template = (
         db.query(EmailTemplate)
         .filter(EmailTemplate.id == template_id, EmailTemplate.company_id == company_id)
@@ -167,9 +138,6 @@ def deletar_template(
     return None
 
 
-# ==========================
-# ✅ NOVO: Preview do template
-# ==========================
 @router.post(
     "/{template_id}/preview",
     response_model=TemplatePreviewResponse,
@@ -179,10 +147,8 @@ def preview_template(
     template_id: UUID,
     payload: TemplatePreviewRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    company: Company = Depends(get_company_for_current_user),
 ):
-    company = _get_company_or_404(db, company_id, user)
-
     template = (
         db.query(EmailTemplate)
         .filter(EmailTemplate.id == template_id, EmailTemplate.company_id == company_id)
@@ -191,7 +157,6 @@ def preview_template(
     if not template:
         raise HTTPException(status_code=404, detail="Template não encontrado")
 
-    # Pega um cliente "de exemplo" só pra conseguir preencher variáveis padrão
     client = (
         db.query(Client)
         .filter(Client.company_id == company_id)
@@ -209,14 +174,12 @@ def preview_template(
     try:
         rendered = render_email_template(
             subject_tpl=template.assunto,
-            body_tpl=template.corpo_html,  # seu campo se chama corpo_html
+            body_tpl=template.corpo_html,
             context=context,
         )
     except ValueError as e:
-        # variável não permitida
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
-        # variável faltando / erro de sintaxe do template
         raise HTTPException(status_code=422, detail=f"Erro ao renderizar template: {e}")
 
     return TemplatePreviewResponse(

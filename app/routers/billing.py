@@ -10,14 +10,13 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, get_company_for_current_user
 from app.database_.database import get_db
 from app.models.billing_charge import BillingCharge
 from app.models.client import Client
 from app.models.company import Company
 from app.models.email_log import EmailLog
 from app.models.user import User
-from app.models.email_template import EmailTemplate
 from app.workers.tasks import send_email_job
 
 from app.services.asaas_client import (
@@ -28,21 +27,11 @@ from app.services.asaas_client import (
     get_payment,
 )
 
-router = APIRouter(prefix="/empresas/{company_id}/cobrancas", tags=["Cobranças"])
-
-
-def _get_company_or_404(db: Session, company_id: UUID, user_id: UUID) -> Company:
-    company = (
-        db.query(Company)
-        .filter(Company.id == company_id, Company.owner_id == user_id)
-        .first()
-    )
-    if not company:
-        raise HTTPException(
-            status_code=404,
-            detail="Empresa não encontrada ou não pertence a você",
-        )
-    return company
+router = APIRouter(
+    prefix="/empresas/{company_id}/cobrancas",
+    tags=["Cobranças"],
+    dependencies=[Depends(get_company_for_current_user)],
+)
 
 
 def _get_charge_or_404(db: Session, company_id: UUID, charge_id: UUID) -> BillingCharge:
@@ -275,10 +264,7 @@ def list_billing_charges(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user.id)
-
     q = (
         db.query(BillingCharge)
         .outerjoin(Client, BillingCharge.client_id == Client.id)
@@ -335,11 +321,8 @@ def get_billing_charge(
     company_id: UUID,
     charge_id: UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user.id)
     charge = _get_charge_or_404(db, company_id, charge_id)
-
     return {
         "ok": True,
         "item": _serialize_charge(charge),
@@ -351,9 +334,7 @@ def sync_billing_charge(
     company_id: UUID,
     charge_id: UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user.id)
     charge = _get_charge_or_404(db, company_id, charge_id)
 
     if not charge.asaas_payment_id:
@@ -393,9 +374,7 @@ def cancel_billing_charge(
     company_id: UUID,
     charge_id: UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user.id)
     charge = _get_charge_or_404(db, company_id, charge_id)
 
     if str(charge.status or "").upper() == "PAID":
@@ -422,9 +401,7 @@ def mark_billing_charge_paid_manually(
     company_id: UUID,
     charge_id: UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user.id)
     charge = _get_charge_or_404(db, company_id, charge_id)
 
     charge.status = "PAID"
@@ -461,11 +438,8 @@ def resend_billing_charge_email(
     company_id: UUID,
     charge_id: UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user.id)
     charge = _get_charge_or_404(db, company_id, charge_id)
-
     log = _enqueue_billing_email(db, company_id, charge)
 
     return {
@@ -482,9 +456,7 @@ def reissue_billing_charge(
     charge_id: UUID,
     body: Dict[str, Any] = Body(default_factory=dict),
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user.id)
     charge = _get_charge_or_404(db, company_id, charge_id)
 
     client = charge.client

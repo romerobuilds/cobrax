@@ -40,8 +40,13 @@ from app.services.upload_parser import parse_upload_file, normalize_header
 from app.services.asaas_client import ensure_customer, create_boleto_payment, build_external_reference
 
 
-router = APIRouter(prefix="/empresas/{company_id}/campanhas", tags=["Campanhas"])
+from app.core.deps import get_company_for_current_user
 
+router = APIRouter(
+    prefix="/empresas/{company_id}/campanhas",
+    tags=["Campanhas"],
+    dependencies=[Depends(get_company_for_current_user)],
+)
 
 def get_db():
     db = SessionLocal()

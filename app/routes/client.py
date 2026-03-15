@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File,
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, get_company_for_current_user
 from app.database_.database import get_db
 from app.models.client import Client
 from app.models.company import Company
@@ -22,27 +22,19 @@ from app.schemas.client import ClientCreate, ClientPublic, ClientUpdate
 from openpyxl import load_workbook
 
 
-router = APIRouter(prefix="/empresas/{company_id}/clientes", tags=["Clientes"])
+router = APIRouter(
+    prefix="/empresas/{company_id}/clientes",
+    tags=["Clientes"],
+    dependencies=[Depends(get_company_for_current_user)],
+)
 
 
-def _get_company_or_404(db: Session, company_id: UUID, user_id: UUID) -> Company:
-    company = (
-        db.query(Company)
-        .filter(Company.id == company_id, Company.owner_id == user_id)
-        .first()
-    )
-    if not company:
-        raise HTTPException(status_code=404, detail="Empresa não encontrada ou não pertence a você")
-    return company
-
-
-def _get_client_or_404(db: Session, company_id: UUID, client_id: UUID, user_id: UUID) -> Client:
+def _get_client_or_404(db: Session, company_id: UUID, client_id: UUID) -> Client:
     client = (
         db.query(Client)
         .filter(
             Client.id == client_id,
             Client.company_id == company_id,
-            Client.owner_id == user_id,
         )
         .first()
     )
@@ -191,8 +183,6 @@ def criar_cliente(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user.id)
-
     existe = (
         db.query(Client)
         .filter(Client.company_id == company_id, Client.email == str(payload.email))
@@ -205,7 +195,7 @@ def criar_cliente(
         nome=payload.nome,
         email=str(payload.email),
         telefone=payload.telefone,
-        cpf_cnpj=_sanitize_cpf_cnpj(getattr(payload, "cpf_cnpj", None)),  # ✅ novo
+        cpf_cnpj=_sanitize_cpf_cnpj(getattr(payload, "cpf_cnpj", None)),
         owner_id=user.id,
         company_id=company_id,
         is_mensalista=bool(payload.is_mensalista or False),
@@ -221,13 +211,10 @@ def criar_cliente(
 def listar_clientes(
     company_id: UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user.id)
-
     return (
         db.query(Client)
-        .filter(Client.company_id == company_id, Client.owner_id == user.id)
+        .filter(Client.company_id == company_id)
         .order_by(Client.created_at.desc())
         .all()
     )
@@ -238,10 +225,8 @@ def obter_cliente(
     company_id: UUID,
     client_id: UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user.id)
-    return _get_client_or_404(db, company_id, client_id, user.id)
+    return _get_client_or_404(db, company_id, client_id)
 
 
 @router.put("/{client_id}", response_model=ClientPublic)
@@ -250,10 +235,8 @@ def atualizar_cliente(
     client_id: UUID,
     payload: ClientUpdate,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user.id)
-    client = _get_client_or_404(db, company_id, client_id, user.id)
+    client = _get_client_or_404(db, company_id, client_id)
 
     if payload.email and str(payload.email) != client.email:
         existe = (
@@ -275,12 +258,9 @@ def atualizar_cliente(
     if payload.telefone is not None:
         client.telefone = payload.telefone
 
-    # ✅ cpf/cnpj (pode ser null pra apagar)
     if hasattr(payload, "cpf_cnpj") and payload.cpf_cnpj is not None:
         client.cpf_cnpj = _sanitize_cpf_cnpj(payload.cpf_cnpj)
     elif hasattr(payload, "cpf_cnpj") and payload.cpf_cnpj is None:
-        # se veio explicitamente null, limpa
-        # (se você não quiser permitir "limpar", remove esse elif)
         client.cpf_cnpj = None
 
     if payload.is_mensalista is not None:
@@ -298,11 +278,8 @@ def deletar_cliente(
     company_id: UUID,
     client_id: UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user.id)
-    client = _get_client_or_404(db, company_id, client_id, user.id)
-
+    client = _get_client_or_404(db, company_id, client_id)
     db.delete(client)
     db.commit()
     return None
@@ -316,22 +293,17 @@ def deletar_cliente(
 async def upload_clients_file(
     company_id: UUID,
     file: UploadFile = File(...),
-
     email_column: str = Query(default="email", description="Nome da coluna do e-mail"),
     nome_column: str = Query(default="nome", description="Nome da coluna do nome"),
     telefone_column: str = Query(default="telefone", description="Nome da coluna do telefone"),
     cpf_cnpj_column: str = Query(default="cpf_cnpj", description="Coluna cpf_cnpj (somente números)"),
-
     mensalista_column: str = Query(default="mensalista", description="Coluna mensalista (sim/nao, true/false, 1/0)"),
     saldo_column: str = Query(default="saldo_aberto", description="Coluna saldo (ex: 123,45)"),
-
     limit: int = Query(default=5000, ge=1, le=50000, description="Máximo de linhas lidas"),
     update_existing: bool = Query(default=False, description="Se true, atualiza cliente existente pelo e-mail"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    _get_company_or_404(db, company_id, user.id)
-
     raw = await file.read()
     if not raw:
         raise HTTPException(status_code=400, detail="Arquivo vazio")
@@ -344,14 +316,13 @@ async def upload_clients_file(
     nome_col = (nome_column or "nome").strip()
     tel_col = (telefone_column or "telefone").strip()
     cpf_col = (cpf_cnpj_column or "cpf_cnpj").strip()
-
     mensalista_col = (mensalista_column or "mensalista").strip()
     saldo_col = (saldo_column or "saldo_aberto").strip()
 
     existing = {
         (e or "").lower(): cid
         for (e, cid) in db.query(Client.email, Client.id)
-        .filter(Client.company_id == company_id, Client.owner_id == user.id)
+        .filter(Client.company_id == company_id)
         .all()
         if e
     }
@@ -374,7 +345,6 @@ async def upload_clients_file(
         nome_val = _find_value_ci(row, nome_col)
         telefone_val = _find_value_ci(row, tel_col)
         cpf_val = _find_value_ci(row, cpf_col)
-
         mensalista_val = _find_value_ci(row, mensalista_col)
         saldo_val = _find_value_ci(row, saldo_col)
 
@@ -382,7 +352,6 @@ async def upload_clients_file(
         telefone = (telefone_val or "").strip()
 
         cpf_clean = _sanitize_cpf_cnpj(cpf_val)
-
         mensalista_bool = _parse_bool(mensalista_val)
         saldo_dec = _parse_money(saldo_val)
 
@@ -397,7 +366,6 @@ async def upload_clients_file(
                 .filter(
                     Client.id == client_id,
                     Client.company_id == company_id,
-                    Client.owner_id == user.id,
                 )
                 .first()
             )
@@ -409,11 +377,8 @@ async def upload_clients_file(
                 c.nome = nome
             if telefone:
                 c.telefone = telefone
-
-            # ✅ cpf_cnpj: se veio válido, atualiza. (se vazio, não mexe)
             if cpf_clean:
                 c.cpf_cnpj = cpf_clean
-
             if mensalista_bool is not None:
                 c.is_mensalista = mensalista_bool
             if saldo_dec is not None:
@@ -429,7 +394,7 @@ async def upload_clients_file(
             nome=nome,
             email=email,
             telefone=telefone or None,
-            cpf_cnpj=cpf_clean,  # ✅ novo
+            cpf_cnpj=cpf_clean,
             owner_id=user.id,
             company_id=company_id,
             is_mensalista=mensalista_bool if mensalista_bool is not None else False,

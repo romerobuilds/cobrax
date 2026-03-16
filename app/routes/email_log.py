@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.core.deps import get_current_user
 from app.database_.database import get_db
 from app.models.company import Company
+from app.models.company_user import CompanyUser
 from app.models.email_log import EmailLog
 from app.models.user import User
 from app.schemas.email_log import EmailLogPublic
@@ -22,13 +23,40 @@ router = APIRouter(
 
 
 def _get_company_or_404(db: Session, company_id: UUID, user: User) -> Company:
-    company = (
-        db.query(Company)
-        .filter(Company.id == company_id, Company.owner_id == user.id)
-        .first()
-    )
+    company = db.query(Company).filter(Company.id == company_id).first()
     if not company:
         raise HTTPException(status_code=404, detail="Empresa não encontrada")
+
+    if user.is_master:
+        if str(company.owner_id) == str(user.id):
+            return company
+
+        membership = (
+            db.query(CompanyUser)
+            .filter(
+                CompanyUser.company_id == company_id,
+                CompanyUser.user_id == user.id,
+                CompanyUser.is_active.is_(True),
+            )
+            .first()
+        )
+        if membership:
+            return company
+
+        raise HTTPException(status_code=404, detail="Empresa não encontrada")
+
+    membership = (
+        db.query(CompanyUser)
+        .filter(
+            CompanyUser.company_id == company_id,
+            CompanyUser.user_id == user.id,
+            CompanyUser.is_active.is_(True),
+        )
+        .first()
+    )
+    if not membership:
+        raise HTTPException(status_code=404, detail="Empresa não encontrada")
+
     return company
 
 
@@ -61,7 +89,6 @@ def listar_logs(
     return q.order_by(EmailLog.created_at.desc()).limit(limit).all()
 
 
-# ✅ IMPORTANTE: /stats PRECISA vir antes de /{log_id}
 @router.get("/stats", status_code=200)
 def logs_stats(
     company_id: UUID,
@@ -74,7 +101,6 @@ def logs_stats(
     now = datetime.now(timezone.utc)
     since = now - timedelta(hours=hours)
 
-    # 1) Totais por status (geral)
     totals = (
         db.query(EmailLog.status, func.count(EmailLog.id))
         .filter(EmailLog.company_id == company_id)
@@ -83,7 +109,6 @@ def logs_stats(
     )
     totals_map = {status: int(count) for status, count in totals}
 
-    # 2) Totais por status (últimas X horas)
     recent = (
         db.query(EmailLog.status, func.count(EmailLog.id))
         .filter(EmailLog.company_id == company_id, EmailLog.created_at >= since)
@@ -92,7 +117,6 @@ def logs_stats(
     )
     recent_map = {status: int(count) for status, count in recent}
 
-    # 3) Erros por tipo (top 8) nas últimas X horas
     top_errors = (
         db.query(EmailLog.error_message, func.count(EmailLog.id).label("count"))
         .filter(
@@ -107,7 +131,6 @@ def logs_stats(
         .all()
     )
 
-    # 4) Taxa de falha (últimas X horas)
     sent_recent = int(recent_map.get("SENT", 0))
     failed_recent = int(recent_map.get("FAILED", 0))
     total_recent = sum(int(v) for v in recent_map.values())

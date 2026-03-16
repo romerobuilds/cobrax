@@ -30,7 +30,7 @@ from app.routes.email_admin import router as email_admin_router
 from app.routes.plan_admin import router as plan_admin_router
 from app.routes.worker_status import router as worker_status_router
 from app.routes.dashboard import router as dashboard_router
-
+from app.routes.asaas_settings import router as asaas_settings_router
 
 app = FastAPI(
     title="COBRAX",
@@ -74,3 +74,4 @@ app.include_router(campaigns_router)
 app.include_router(dashboard_router)
 app.include_router(asaas_webhook_router)
 app.include_router(billing_router)
+app.include_router(asaas_settings_router)

@@ -36,3 +36,27 @@ class CompanySmtpSettingsOut(BaseModel):
 
 class CompanySmtpTestIn(BaseModel):
     to_email: EmailStr
+
+
+# =========================
+# ASAAS
+# =========================
+class CompanyAsaasSettingsUpdate(BaseModel):
+    asaas_api_key: Optional[str] = None
+    asaas_base_url: Optional[str] = Field(default=None, max_length=255)
+
+
+class CompanyAsaasSettingsOut(BaseModel):
+    company_id: str
+    company_name: str
+
+    asaas_base_url: Optional[str] = None
+
+    api_key_configured: bool = False
+    asaas_configured: bool = False
+
+    dashboard_url: str = "https://www.asaas.com/"
+    sandbox_url: str = "https://sandbox.asaas.com/"
+
+    class Config:
+        from_attributes = True

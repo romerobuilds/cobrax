@@ -14,14 +14,14 @@ import requests
 DEFAULT_BASE = "https://api.asaas.com/v3"
 
 
-def _asaas_base_url() -> str:
-    return (os.getenv("ASAAS_BASE_URL") or DEFAULT_BASE).strip().rstrip("/")
+def _asaas_base_url(base_url: Optional[str] = None) -> str:
+    return (base_url or os.getenv("ASAAS_BASE_URL") or DEFAULT_BASE).strip().rstrip("/")
 
 
-def _asaas_headers() -> Dict[str, str]:
-    api_key = (os.getenv("ASAAS_API_KEY") or "").strip()
-    if not api_key:
-        raise RuntimeError("ASAAS_API_KEY não configurada no .env")
+def _asaas_headers(api_key: Optional[str] = None) -> Dict[str, str]:
+    final_api_key = (api_key or os.getenv("ASAAS_API_KEY") or "").strip()
+    if not final_api_key:
+        raise RuntimeError("ASAAS_API_KEY não configurada")
 
     user_agent = (os.getenv("ASAAS_USER_AGENT") or "COBRAX").strip()
 
@@ -29,7 +29,7 @@ def _asaas_headers() -> Dict[str, str]:
         "Content-Type": "application/json",
         "Accept": "application/json",
         "User-Agent": user_agent,
-        "access_token": api_key,
+        "access_token": final_api_key,
     }
 
 
@@ -45,10 +45,6 @@ def _raise_for_status_with_body(resp: requests.Response) -> None:
 
 
 def build_external_reference(company_id: str, client_id: str) -> str:
-    """
-    Formato que o seu webhook já sabe interpretar:
-      company:<uuid>|client:<uuid>
-    """
     return f"company:{company_id}|client:{client_id}"
 
 
@@ -63,16 +59,30 @@ def _sanitize_cpf_cnpj(value: Optional[str]) -> Optional[str]:
     return s
 
 
-def ensure_customer(name: str, email: str, cpf_cnpj: Optional[str] = None) -> str:
-    """
-    MVP:
-      - busca customer por email
-      - se existir:
-          - se cpf_cnpj foi informado e customer não tem cpfCnpj, atualiza via PUT
-      - se não existir: cria com cpfCnpj (se válido)
-    """
-    base = _asaas_base_url()
-    headers = _asaas_headers()
+def ping_asaas(api_key: str, base_url: Optional[str] = None) -> Dict[str, Any]:
+    base = _asaas_base_url(base_url)
+    headers = _asaas_headers(api_key)
+
+    r = requests.get(
+        f"{base}/customers",
+        headers=headers,
+        params={"limit": 1, "offset": 0},
+        timeout=20,
+    )
+    _raise_for_status_with_body(r)
+    return r.json() or {}
+
+
+def ensure_customer(
+    name: str,
+    email: str,
+    cpf_cnpj: Optional[str] = None,
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> str:
+    base = _asaas_base_url(base_url)
+    headers = _asaas_headers(api_key)
 
     cpf_cnpj_clean = _sanitize_cpf_cnpj(cpf_cnpj)
 
@@ -128,13 +138,12 @@ def create_boleto_payment(
     due_date: date,
     description: str,
     external_reference: Optional[str] = None,
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Cria cobrança via boleto.
-    Retorna JSON do Asaas (invoiceUrl/bankSlipUrl/etc).
-    """
-    base = _asaas_base_url()
-    headers = _asaas_headers()
+    base = _asaas_base_url(base_url)
+    headers = _asaas_headers(api_key)
 
     value_2 = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
@@ -159,15 +168,17 @@ def create_boleto_payment(
     return r.json() or {}
 
 
-def get_payment(payment_id: str) -> Dict[str, Any]:
-    """
-    Consulta um pagamento no Asaas pelo ID.
-    """
+def get_payment(
+    payment_id: str,
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> Dict[str, Any]:
     if not payment_id:
         raise RuntimeError("payment_id é obrigatório")
 
-    base = _asaas_base_url()
-    headers = _asaas_headers()
+    base = _asaas_base_url(base_url)
+    headers = _asaas_headers(api_key)
 
     r = requests.get(
         f"{base}/payments/{payment_id}",
@@ -178,15 +189,17 @@ def get_payment(payment_id: str) -> Dict[str, Any]:
     return r.json() or {}
 
 
-def delete_payment(payment_id: str) -> Dict[str, Any]:
-    """
-    Remove/cancela uma cobrança no Asaas.
-    """
+def delete_payment(
+    payment_id: str,
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> Dict[str, Any]:
     if not payment_id:
         raise RuntimeError("payment_id é obrigatório")
 
-    base = _asaas_base_url()
-    headers = _asaas_headers()
+    base = _asaas_base_url(base_url)
+    headers = _asaas_headers(api_key)
 
     r = requests.delete(
         f"{base}/payments/{payment_id}",
@@ -208,14 +221,12 @@ def _is_asaas_domain(url: str) -> bool:
     return host.endswith("asaas.com")
 
 
-def download_url_as_bytes(url: str, timeout: int = 25) -> Tuple[bytes, str]:
-    """
-    Baixa um URL e retorna (bytes, content_type).
-
-    Importante:
-    - Se o URL for do Asaas, envia também o access_token.
-    - Se não for Asaas, não envia token.
-    """
+def download_url_as_bytes(
+    url: str,
+    timeout: int = 25,
+    *,
+    api_key: Optional[str] = None,
+) -> Tuple[bytes, str]:
     if not url:
         raise RuntimeError("URL vazio para download")
 
@@ -223,9 +234,9 @@ def download_url_as_bytes(url: str, timeout: int = 25) -> Tuple[bytes, str]:
     headers: Dict[str, str] = {"User-Agent": user_agent}
 
     if _is_asaas_domain(url):
-        api_key = (os.getenv("ASAAS_API_KEY") or "").strip()
-        if api_key:
-            headers["access_token"] = api_key
+        final_api_key = (api_key or os.getenv("ASAAS_API_KEY") or "").strip()
+        if final_api_key:
+            headers["access_token"] = final_api_key
 
     r = requests.get(url, headers=headers, timeout=timeout)
     _raise_for_status_with_body(r)

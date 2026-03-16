@@ -22,7 +22,7 @@ from app.schemas.campaign import (
     CampaignScheduleIn,
     CampaignScheduleOut,
 )
-
+from app.models.company import Company
 from app.models.campaign import Campaign
 from app.models.campaign_run import CampaignRun
 from app.models.campaign_target import CampaignTarget
@@ -243,6 +243,11 @@ def _merge_campaign_context(vars_ctx: Dict[str, Any], meta_ctx: Dict[str, Any]) 
     # sempre salva no formato novo (limpo)
     return {"vars": (vars_ctx or {}), "meta": (meta_ctx or {})}
 
+def _get_company(db: Session, company_id: str) -> Company:
+    company = db.query(Company).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Empresa não encontrada")
+    return company
 
 # ======================================================
 # SCHEDULE (NOVO)
@@ -793,6 +798,8 @@ async def upload_targets_file(
 def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
     camp = _ensure_campaign_company(db, company_id, campaign_id)
 
+    company = _get_company(db, company_id)
+
     if camp.status not in ("draft", "ready", "scheduled"):
         raise HTTPException(
             status_code=400,
@@ -955,12 +962,16 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
 
             try:
                 # 0) garante customer no Asaas (agora com CPF/CNPJ)
+                if not (company.asaas_api_key or "").strip():
+                    raise RuntimeError("Asaas não configurado para esta empresa")
+
                 customer_id = ensure_customer(
                     name=client_obj.nome,
                     email=client_obj.email,
                     cpf_cnpj=cpf_cnpj,
+                    api_key=company.asaas_api_key,
+                    base_url=company.asaas_base_url,
                 )
-
                 # 1) cria cobrança local ANTES (campaign_id é NOT NULL no teu schema)
                 ch = BillingCharge(
                     company_id=camp.company_id,
@@ -985,6 +996,8 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                     due_date=due,
                     description=descricao,
                     external_reference=ext_ref,
+                    api_key=company.asaas_api_key,
+                    base_url=company.asaas_base_url,
                 )
 
                 asaas_payment_id = str(payment.get("id") or "")

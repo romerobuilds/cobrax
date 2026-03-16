@@ -18,9 +18,12 @@ from app.schemas.company_smtp_settings import (
     CompanySmtpSettingsOut,
     CompanySmtpSettingsUpdate,
     CompanySmtpTestIn,
+    CompanyAsaasSettingsOut,
+    CompanyAsaasSettingsUpdate,
 )
 from app.schemas.email_admin import CompanyEmailSettingsUpdate
 from app.services.mailer import send_smtp_email
+from app.services.asaas_client import ping_asaas
 
 router = APIRouter(prefix="/empresas", tags=["Empresas"])
 
@@ -93,6 +96,21 @@ def _smtp_out(company: Company) -> CompanySmtpSettingsOut:
         from_name=company.from_name,
         password_configured=password_configured,
         smtp_configured=smtp_configured,
+    )
+
+
+def _asaas_out(company: Company) -> CompanyAsaasSettingsOut:
+    base_url = (company.asaas_base_url or "").strip() or "https://api.asaas.com/v3"
+    api_key_configured = bool((company.asaas_api_key or "").strip())
+
+    return CompanyAsaasSettingsOut(
+        company_id=str(company.id),
+        company_name=company.nome,
+        asaas_base_url=base_url,
+        api_key_configured=api_key_configured,
+        asaas_configured=api_key_configured,
+        dashboard_url="https://www.asaas.com/",
+        sandbox_url="https://sandbox.asaas.com/",
     )
 
 
@@ -326,6 +344,79 @@ def test_smtp_settings(
     return {
         "ok": True,
         "message": "Teste de envio realizado com sucesso",
+    }
+
+
+# =========================
+# ASAAS SETTINGS
+# =========================
+@router.get(
+    "/{company_id}/asaas-settings",
+    response_model=CompanyAsaasSettingsOut,
+    status_code=status.HTTP_200_OK,
+)
+def get_asaas_settings(
+    company_id: UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    company = _get_company_or_404(db, company_id, user)
+    return _asaas_out(company)
+
+
+@router.put(
+    "/{company_id}/asaas-settings",
+    response_model=CompanyAsaasSettingsOut,
+    status_code=status.HTTP_200_OK,
+)
+def put_asaas_settings(
+    company_id: UUID,
+    payload: CompanyAsaasSettingsUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    company = _get_company_or_404(db, company_id, user)
+
+    if payload.asaas_base_url is not None:
+        company.asaas_base_url = payload.asaas_base_url.strip() or None
+
+    if payload.asaas_api_key is not None:
+        new_key = payload.asaas_api_key.strip()
+        if new_key:
+            company.asaas_api_key = new_key
+
+    db.add(company)
+    db.commit()
+    db.refresh(company)
+
+    return _asaas_out(company)
+
+
+@router.post(
+    "/{company_id}/asaas-settings/test",
+    status_code=status.HTTP_200_OK,
+)
+def test_asaas_settings(
+    company_id: UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    company = _get_company_or_404(db, company_id, user)
+
+    if not (company.asaas_api_key or "").strip():
+        raise HTTPException(status_code=400, detail="Configure a API Key do Asaas antes do teste")
+
+    try:
+        ping_asaas(
+            api_key=company.asaas_api_key,
+            base_url=company.asaas_base_url,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Não foi possível validar o Asaas: {e}")
+
+    return {
+        "ok": True,
+        "message": "Integração Asaas validada com sucesso",
     }
 
 

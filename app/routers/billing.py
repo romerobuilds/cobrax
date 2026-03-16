@@ -34,6 +34,21 @@ router = APIRouter(
 )
 
 
+def _get_company_or_404(db: Session, company_id: UUID) -> Company:
+    company = db.query(Company).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Empresa não encontrada")
+    return company
+
+
+def _ensure_company_asaas(company: Company) -> None:
+    if not (company.asaas_api_key or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Asaas não configurado para esta empresa",
+        )
+
+
 def _get_charge_or_404(db: Session, company_id: UUID, charge_id: UUID) -> BillingCharge:
     charge = (
         db.query(BillingCharge)
@@ -335,12 +350,19 @@ def sync_billing_charge(
     charge_id: UUID,
     db: Session = Depends(get_db),
 ):
+    company = _get_company_or_404(db, company_id)
+    _ensure_company_asaas(company)
+
     charge = _get_charge_or_404(db, company_id, charge_id)
 
     if not charge.asaas_payment_id:
         raise HTTPException(status_code=400, detail="Cobrança sem asaas_payment_id para sincronizar")
 
-    payment = get_payment(str(charge.asaas_payment_id))
+    payment = get_payment(
+        str(charge.asaas_payment_id),
+        api_key=company.asaas_api_key,
+        base_url=company.asaas_base_url,
+    )
     now = datetime.now(timezone.utc)
 
     charge.status = _normalize_charge_status(payment.get("status"))
@@ -375,13 +397,20 @@ def cancel_billing_charge(
     charge_id: UUID,
     db: Session = Depends(get_db),
 ):
+    company = _get_company_or_404(db, company_id)
+    _ensure_company_asaas(company)
+
     charge = _get_charge_or_404(db, company_id, charge_id)
 
     if str(charge.status or "").upper() == "PAID":
         raise HTTPException(status_code=400, detail="Cobrança já está paga e não pode ser cancelada")
 
     if charge.asaas_payment_id:
-        delete_payment(str(charge.asaas_payment_id))
+        delete_payment(
+            str(charge.asaas_payment_id),
+            api_key=company.asaas_api_key,
+            base_url=company.asaas_base_url,
+        )
 
     charge.status = "CANCELLED"
     charge.updated_at = datetime.now(timezone.utc)
@@ -457,6 +486,9 @@ def reissue_billing_charge(
     body: Dict[str, Any] = Body(default_factory=dict),
     db: Session = Depends(get_db),
 ):
+    company = _get_company_or_404(db, company_id)
+    _ensure_company_asaas(company)
+
     charge = _get_charge_or_404(db, company_id, charge_id)
 
     client = charge.client
@@ -473,7 +505,11 @@ def reissue_billing_charge(
         old_status = str(charge.status or "").upper()
         if old_status != "PAID" and charge.asaas_payment_id:
             try:
-                delete_payment(str(charge.asaas_payment_id))
+                delete_payment(
+                    str(charge.asaas_payment_id),
+                    api_key=company.asaas_api_key,
+                    base_url=company.asaas_base_url,
+                )
             except Exception:
                 pass
 
@@ -489,6 +525,8 @@ def reissue_billing_charge(
             name=client.nome,
             email=client.email,
             cpf_cnpj=getattr(client, "cpf_cnpj", None),
+            api_key=company.asaas_api_key,
+            base_url=company.asaas_base_url,
         )
 
         payment = create_boleto_payment(
@@ -497,6 +535,8 @@ def reissue_billing_charge(
             due_date=due_date,
             description=description,
             external_reference=build_external_reference(str(company_id), str(client.id)),
+            api_key=company.asaas_api_key,
+            base_url=company.asaas_base_url,
         )
 
         charge.asaas_customer_id = str(customer_id)

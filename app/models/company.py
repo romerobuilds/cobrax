@@ -42,6 +42,12 @@ class Company(Base):
     emails_sent_today = Column(Integer, nullable=False, default=0)
     emails_sent_today_at = Column(DateTime(timezone=True), nullable=True)
 
+    # =========================
+    # ASAAS (por empresa)
+    # =========================
+    asaas_api_key = Column(String, nullable=True)
+    asaas_base_url = Column(String, nullable=True)
+
     clients = relationship(
         "Client",
         back_populates="company",

@@ -109,7 +109,7 @@ def _looks_like_html(s: str) -> bool:
 def _strip_html_simple(html: str) -> str:
     if not html:
         return ""
-    txt = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", html)
+    txt = re.sub(r"(?is)<(script|style).?>.?</\1>", "", html)
     txt = re.sub(r"(?is)<br\s*/?>", "\n", txt)
     txt = re.sub(r"(?is)</p\s*>", "\n\n", txt)
     txt = re.sub(r"(?is)<.*?>", "", txt)
@@ -255,7 +255,10 @@ def send_email_job(self, log_id: str):
             boleto_url = (getattr(log, "asaas_bank_slip_url", None) or "").strip()
             if boleto_url:
                 try:
-                    content, content_type = download_url_as_bytes(boleto_url)
+                    content, content_type = download_url_as_bytes(
+                        boleto_url,
+                        api_key=(company.asaas_api_key or "").strip() or None,
+                    )
                     ct = (content_type or "").lower()
 
                     is_pdf = ("application/pdf" in ct) or boleto_url.lower().endswith(".pdf")

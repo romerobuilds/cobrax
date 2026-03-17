@@ -1,4 +1,3 @@
-# app/services/asaas_client.py
 from __future__ import annotations
 
 import os
@@ -59,7 +58,13 @@ def _sanitize_cpf_cnpj(value: Optional[str]) -> Optional[str]:
     return s
 
 
-def ping_asaas(api_key: str, base_url: Optional[str] = None) -> Dict[str, Any]:
+def ping_asaas(
+    api_key: str,
+    base_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Faz uma chamada simples ao Asaas para validar credenciais/base_url.
+    """
     base = _asaas_base_url(base_url)
     headers = _asaas_headers(api_key)
 
@@ -81,21 +86,36 @@ def ensure_customer(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
 ) -> str:
+    """
+    Busca customer por e-mail.
+    Se existir, retorna o ID.
+    Se não existir, cria.
+    Se existir e vier cpf_cnpj válido mas o customer ainda não tiver cpfCnpj, atualiza.
+    """
+    if not str(name or "").strip():
+        raise RuntimeError("name é obrigatório para criar customer no Asaas")
+
+    if not str(email or "").strip():
+        raise RuntimeError("email é obrigatório para criar customer no Asaas")
+
     base = _asaas_base_url(base_url)
     headers = _asaas_headers(api_key)
 
     cpf_cnpj_clean = _sanitize_cpf_cnpj(cpf_cnpj)
+    email_clean = str(email).strip().lower()
+    name_clean = str(name).strip()
 
     r = requests.get(
         f"{base}/customers",
         headers=headers,
-        params={"email": email},
+        params={"email": email_clean},
         timeout=20,
     )
     _raise_for_status_with_body(r)
 
     data = r.json() or {}
     items = data.get("data") or []
+
     if items and items[0].get("id"):
         customer = items[0]
         cid = str(customer["id"])
@@ -113,7 +133,10 @@ def ensure_customer(
 
         return cid
 
-    payload_create: Dict[str, Any] = {"name": name, "email": email}
+    payload_create: Dict[str, Any] = {
+        "name": name_clean,
+        "email": email_clean,
+    }
     if cpf_cnpj_clean:
         payload_create["cpfCnpj"] = cpf_cnpj_clean
 
@@ -129,6 +152,7 @@ def ensure_customer(
     cid = created.get("id")
     if not cid:
         raise RuntimeError(f"Falha ao criar customer no Asaas: {created}")
+
     return str(cid)
 
 
@@ -142,21 +166,36 @@ def create_boleto_payment(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    Cria cobrança boleto no Asaas.
+    """
+    if not str(customer_id or "").strip():
+        raise RuntimeError("customer_id é obrigatório")
+
+    if value is None:
+        raise RuntimeError("value é obrigatório")
+
+    if due_date is None:
+        raise RuntimeError("due_date é obrigatório")
+
+    if not str(description or "").strip():
+        raise RuntimeError("description é obrigatória")
+
     base = _asaas_base_url(base_url)
     headers = _asaas_headers(api_key)
 
-    value_2 = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    value_2 = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
     payload: Dict[str, Any] = {
-        "customer": customer_id,
+        "customer": str(customer_id).strip(),
         "billingType": "BOLETO",
         "value": float(value_2),
         "dueDate": due_date.isoformat(),
-        "description": description,
+        "description": str(description).strip(),
     }
 
     if external_reference:
-        payload["externalReference"] = external_reference
+        payload["externalReference"] = str(external_reference).strip()
 
     r = requests.post(
         f"{base}/payments",
@@ -174,14 +213,17 @@ def get_payment(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
 ) -> Dict[str, Any]:
-    if not payment_id:
+    """
+    Consulta pagamento pelo ID.
+    """
+    if not str(payment_id or "").strip():
         raise RuntimeError("payment_id é obrigatório")
 
     base = _asaas_base_url(base_url)
     headers = _asaas_headers(api_key)
 
     r = requests.get(
-        f"{base}/payments/{payment_id}",
+        f"{base}/payments/{str(payment_id).strip()}",
         headers=headers,
         timeout=20,
     )
@@ -195,18 +237,22 @@ def delete_payment(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
 ) -> Dict[str, Any]:
-    if not payment_id:
+    """
+    Cancela/remove cobrança no Asaas.
+    """
+    if not str(payment_id or "").strip():
         raise RuntimeError("payment_id é obrigatório")
 
     base = _asaas_base_url(base_url)
     headers = _asaas_headers(api_key)
 
     r = requests.delete(
-        f"{base}/payments/{payment_id}",
+        f"{base}/payments/{str(payment_id).strip()}",
         headers=headers,
         timeout=20,
     )
     _raise_for_status_with_body(r)
+
     try:
         return r.json() or {}
     except Exception:
@@ -227,7 +273,11 @@ def download_url_as_bytes(
     *,
     api_key: Optional[str] = None,
 ) -> Tuple[bytes, str]:
-    if not url:
+    """
+    Baixa um arquivo por URL.
+    Se for domínio do Asaas, envia access_token automaticamente.
+    """
+    if not str(url or "").strip():
         raise RuntimeError("URL vazio para download")
 
     user_agent = (os.getenv("ASAAS_USER_AGENT") or "COBRAX").strip()
@@ -238,7 +288,7 @@ def download_url_as_bytes(
         if final_api_key:
             headers["access_token"] = final_api_key
 
-    r = requests.get(url, headers=headers, timeout=timeout)
+    r = requests.get(str(url).strip(), headers=headers, timeout=timeout)
     _raise_for_status_with_body(r)
 
     ct = (r.headers.get("Content-Type") or "application/octet-stream").split(";")[0].strip().lower()

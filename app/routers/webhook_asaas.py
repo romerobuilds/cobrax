@@ -41,11 +41,6 @@ def _is_uuid(text: Optional[str]) -> bool:
 
 
 def _try_parse_external_reference(ext: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Espera algo como:
-      company:<uuid>|client:<uuid>
-    Retorna (company_id, client_id)
-    """
     if not ext:
         return (None, None)
 
@@ -89,15 +84,12 @@ async def asaas_webhook(
 
     now = datetime.now(timezone.utc)
 
-    # 1) Tenta achar por asaas_payment_id
     charge: BillingCharge | None = (
         db.query(BillingCharge)
         .filter(BillingCharge.asaas_payment_id == str(payment_id))
         .first()
     )
 
-    # 2) Se não achou por payment_id e externalReference for UUID,
-    # tenta mapear por BillingCharge.id
     if not charge and external_reference and _is_uuid(external_reference):
         maybe_charge = db.query(BillingCharge).filter(BillingCharge.id == external_reference).first()
         if maybe_charge:
@@ -114,8 +106,6 @@ async def asaas_webhook(
             db.refresh(maybe_charge)
             charge = maybe_charge
 
-    # 3) Se ainda não achou, tenta mapear por client/company do externalReference,
-    # MAS só para localizar melhor o caso; não cria cobrança nova sem campaign_id.
     if not charge and external_reference:
         company_id, client_id = _try_parse_external_reference(external_reference)
         if client_id and company_id:
@@ -141,7 +131,6 @@ async def asaas_webhook(
                 db.commit()
                 db.refresh(charge)
 
-    # 4) Se ainda não existe, ignora
     if not charge:
         return {
             "ok": True,
@@ -152,7 +141,6 @@ async def asaas_webhook(
             "externalReference": external_reference,
         }
 
-    # 5) Atualiza por evento
     if event in ("PAYMENT_RECEIVED", "PAYMENT_CONFIRMED"):
         charge.status = "PAID"
         charge.paid_at = now

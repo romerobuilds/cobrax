@@ -10,13 +10,12 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
-from app.core.deps import get_current_user, get_company_for_current_user
+from app.core.deps import get_company_for_current_user
 from app.database_.database import get_db
 from app.models.billing_charge import BillingCharge
 from app.models.client import Client
 from app.models.company import Company
 from app.models.email_log import EmailLog
-from app.models.user import User
 from app.workers.tasks import send_email_job
 
 from app.services.asaas_client import (
@@ -73,7 +72,7 @@ def _money_to_str(v: Any) -> str:
 
 def _money_to_float(v: Any) -> float:
     try:
-        return float(Decimal(str(v or 0)).quantize(Decimal("0.01")))
+        return float(Decimal(str(v or 0)).quantize(Decimal('0.01')))
     except Exception:
         return 0.0
 

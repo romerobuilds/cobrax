@@ -32,14 +32,8 @@ from app.models.email_log import EmailLog
 from app.models.billing_charge import BillingCharge
 
 from app.workers.tasks import send_email_job
-
-# Reuso do parser CSV/XLSX (o mesmo da fase B)
 from app.services.upload_parser import parse_upload_file, normalize_header
-
-# Asaas
 from app.services.asaas_client import ensure_customer, create_boleto_payment, build_external_reference
-
-
 from app.core.deps import get_company_for_current_user
 
 router = APIRouter(
@@ -48,6 +42,7 @@ router = APIRouter(
     dependencies=[Depends(get_company_for_current_user)],
 )
 
+
 def get_db():
     db = SessionLocal()
     try:
@@ -55,10 +50,6 @@ def get_db():
     finally:
         db.close()
 
-
-# -------------------------
-# Helpers
-# -------------------------
 
 def _parse_weekdays(s: str | None):
     if not s:
@@ -177,10 +168,6 @@ def _ctx_int(ctx: Dict[str, Any], key: str, default: int = 0) -> int:
 
 
 def _parse_decimal_br(value: Any) -> Optional[Decimal]:
-    """
-    Aceita: Decimal, int/float, "99.90", "99,90", "R$ 99,90", "R$ 1.234,56"
-    Retorna Decimal ou None.
-    """
     if value is None:
         return None
     if isinstance(value, Decimal):
@@ -198,12 +185,10 @@ def _parse_decimal_br(value: Any) -> Optional[Decimal]:
     s = s.replace("R$", "").replace("r$", "").strip()
     s = re.sub(r"[^\d,.\-]", "", s)
 
-    # Se tem vírgula e ponto, assume BR: 1.234,56 -> 1234.56
     if "," in s and "." in s:
         s = s.replace(".", "")
         s = s.replace(",", ".")
     else:
-        # Se só tem vírgula: 99,90 -> 99.90
         if "," in s and "." not in s:
             s = s.replace(",", ".")
 
@@ -214,20 +199,12 @@ def _parse_decimal_br(value: Any) -> Optional[Decimal]:
 
 
 def _split_context(raw: Dict[str, Any] | None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Compat:
-      - Novo: {"vars": {...}, "meta": {...}}
-      - Alternativo: {"vars": {...}, "__meta": {...}}
-      - Antigo (flat): {"valor":..., "is_cobranca": true, ...}
-        -> move chaves de controle pra meta e remove de vars
-    """
     ctx = dict(raw or {})
     if isinstance(ctx.get("vars"), dict):
         vars_ctx = dict(ctx.get("vars") or {})
         meta_ctx = dict(ctx.get("meta") or ctx.get("__meta") or {})
         return vars_ctx, meta_ctx
 
-    # flat compat: separa flags conhecidas
     meta_keys = {"is_cobranca", "emitir_boletos", "due_days"}
     meta_ctx: Dict[str, Any] = {}
     vars_ctx: Dict[str, Any] = dict(ctx)
@@ -240,8 +217,8 @@ def _split_context(raw: Dict[str, Any] | None) -> Tuple[Dict[str, Any], Dict[str
 
 
 def _merge_campaign_context(vars_ctx: Dict[str, Any], meta_ctx: Dict[str, Any]) -> Dict[str, Any]:
-    # sempre salva no formato novo (limpo)
     return {"vars": (vars_ctx or {}), "meta": (meta_ctx or {})}
+
 
 def _get_company(db: Session, company_id: str) -> Company:
     company = db.query(Company).filter(Company.id == company_id).first()
@@ -249,9 +226,6 @@ def _get_company(db: Session, company_id: str) -> Company:
         raise HTTPException(status_code=404, detail="Empresa não encontrada")
     return company
 
-# ======================================================
-# SCHEDULE (NOVO)
-# ======================================================
 
 @router.get("/{campaign_id}/schedule", response_model=CampaignScheduleOut)
 def get_schedule(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
@@ -291,18 +265,14 @@ def set_schedule(
                     raise HTTPException(status_code=400, detail="repeat_weekdays deve ser 0..6")
 
     camp.is_schedule_enabled = bool(payload.is_enabled)
-
     camp.start_at = payload.start_at
     camp.next_run_at = payload.start_at
     camp.timezone = payload.timezone or "America/Sao_Paulo"
-
     camp.repeat_type = payload.repeat_type
     camp.repeat_every = int(payload.repeat_every or 0)
     camp.repeat_weekdays = _weekdays_to_str(payload.repeat_weekdays)
-
     camp.end_at = payload.end_at
     camp.max_occurrences = payload.max_occurrences
-
     camp.occurrences = int(getattr(camp, "occurrences", 0) or 0)
 
     db.add(camp)
@@ -321,10 +291,6 @@ def disable_schedule(company_id: str, campaign_id: str, db: Session = Depends(ge
     db.refresh(camp)
     return get_schedule(company_id, campaign_id, db)
 
-
-# ======================================================
-# PREVIEW (Wizard de Campanhas - Fase C)
-# ======================================================
 
 @router.post("/preview-upload", operation_id="campaigns_preview_upload")
 async def preview_upload_file(
@@ -379,10 +345,7 @@ async def preview_upload_file(
 
         normalized_rows.append(nr)
 
-    vars_suggested = sorted(
-        {k for r in normalized_rows[:200] for k in r.keys()} - {email_col_l}
-    )
-
+    vars_suggested = sorted({k for r in normalized_rows[:200] for k in r.keys()} - {email_col_l})
     sample = normalized_rows[:10]
 
     return {
@@ -428,10 +391,6 @@ def preview_render(
     }
 
 
-# ======================================================
-# RUNS
-# ======================================================
-
 @router.get("/runs/{run_id}", response_model=CampaignRunOut, operation_id="campaigns_runs_get")
 def get_run(company_id: str, run_id: str, db: Session = Depends(get_db)):
     run = (
@@ -476,10 +435,6 @@ def get_run_stats(company_id: str, run_id: str, db: Session = Depends(get_db)):
     return out
 
 
-# =========================
-# CRUD
-# =========================
-
 @router.get("/", response_model=List[CampaignOut], operation_id="campaigns_list")
 def list_campaigns(company_id: str, db: Session = Depends(get_db)):
     items = (
@@ -496,9 +451,8 @@ def create_campaign(company_id: str, body: CampaignCreate, db: Session = Depends
     _ensure_template_exists(db, company_id, str(body.template_id))
 
     initial_status = "scheduled" if body.scheduled_at is not None else "draft"
-
-    # aceita context antigo ou novo, mas salva sempre no formato novo
     vars_ctx, meta_ctx = _split_context(body.context or {})
+
     camp = Campaign(
         company_id=company_id,
         name=body.name,
@@ -541,7 +495,6 @@ def update_campaign(company_id: str, campaign_id: str, body: CampaignUpdate, db:
     scheduled_changed = "scheduled_at" in data
     new_scheduled_at = data.get("scheduled_at", None)
 
-    # normaliza context se vier no patch
     if "context" in data:
         vars_ctx, meta_ctx = _split_context(data.get("context") or {})
         data["context"] = _merge_campaign_context(vars_ctx, meta_ctx)
@@ -571,10 +524,6 @@ def delete_campaign(company_id: str, campaign_id: str, db: Session = Depends(get
     db.commit()
     return {"ok": True}
 
-
-# =========================
-# TARGETS
-# =========================
 
 @router.post("/{campaign_id}/targets/selected", operation_id="campaigns_targets_selected_add")
 def add_targets_selected(
@@ -790,14 +739,9 @@ async def upload_targets_file(
     }
 
 
-# =========================
-# RUN (com Cobrança/Boletos)
-# =========================
-
 @router.post("/{campaign_id}/run", response_model=CampaignRunOut, operation_id="campaigns_run_start")
 def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
     camp = _ensure_campaign_company(db, company_id, campaign_id)
-
     company = _get_company(db, company_id)
 
     if camp.status not in ("draft", "ready", "scheduled"):
@@ -812,13 +756,13 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
     if not targets:
         raise HTTPException(status_code=400, detail="Campanha sem targets")
 
-    # context limpo: vars (template) + meta (controle cobrança)
     vars_base, meta = _split_context(camp.context or {})
-
-    # flags via meta
     is_cobranca = _ctx_bool(meta, "is_cobranca", False)
     emitir_boletos = _ctx_bool(meta, "emitir_boletos", False)
     due_days = max(0, _ctx_int(meta, "due_days", 3))
+
+    if is_cobranca and emitir_boletos and not (company.asaas_api_key or "").strip():
+        raise HTTPException(status_code=400, detail="Asaas não configurado para esta empresa")
 
     run = CampaignRun(campaign_id=camp.id, status="running", totals={})
     db.add(run)
@@ -832,11 +776,9 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
     queued_log_ids: List[str] = []
 
     for t in targets:
-        # por segurança: defaults por target (evita variável "vazar" de um loop pro outro)
         bank_slip_url_for_log: str | None = None
         should_attach_for_log: bool = False
 
-        # ctx que vai para o template: SOMENTE variáveis (não inclui meta)
         ctx: Dict[str, Any] = dict(vars_base or {})
         if t.payload:
             ctx.update(t.payload)
@@ -867,12 +809,8 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
         if not to_email:
             continue
 
-        # ==========================
-        # COBRANÇA: gera boleto e injeta {{link_boleto}} etc
-        # ==========================
         if is_cobranca and emitir_boletos:
             if client_obj is None:
-                # ✅ CORRETO: cobrança exige client_id (não dá pra gerar boleto com target só por email)
                 log = EmailLog(
                     company_id=company_id,
                     client_id=None,
@@ -894,7 +832,6 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                 db.commit()
                 continue
 
-            # CPF/CNPJ (Opção A) - obrigatório pro Asaas criar cobrança
             cpf_cnpj = getattr(client_obj, "cpf_cnpj", None)
             if not cpf_cnpj:
                 log = EmailLog(
@@ -945,10 +882,8 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                 db.commit()
                 continue
 
-            # default due: hoje + due_days
             due: date = (datetime.now(timezone.utc) + timedelta(days=due_days)).date()
 
-            # se o usuário informou vencimento no template vars, tenta usar
             venc = ctx.get("vencimento")
             if venc:
                 try:
@@ -961,10 +896,6 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
             descricao = f"Cobrança COBRAX • Campanha {camp.name}"
 
             try:
-                # 0) garante customer no Asaas (agora com CPF/CNPJ)
-                if not (company.asaas_api_key or "").strip():
-                    raise RuntimeError("Asaas não configurado para esta empresa")
-
                 customer_id = ensure_customer(
                     name=client_obj.nome,
                     email=client_obj.email,
@@ -972,7 +903,7 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                     api_key=company.asaas_api_key,
                     base_url=company.asaas_base_url,
                 )
-                # 1) cria cobrança local ANTES (campaign_id é NOT NULL no teu schema)
+
                 ch = BillingCharge(
                     company_id=camp.company_id,
                     campaign_id=camp.id,
@@ -986,9 +917,8 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                     bank_slip_url=None,
                 )
                 db.add(ch)
-                db.flush()  # garante ch.id sem commit ainda
+                db.flush()
 
-                # 2) cria payment no Asaas
                 ext_ref = build_external_reference(str(camp.company_id), str(client_obj.id))
                 payment = create_boleto_payment(
                     customer_id=customer_id,
@@ -1004,15 +934,12 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                 invoice_url = payment.get("invoiceUrl")
                 bank_slip_url = payment.get("bankSlipUrl")
 
-                # ✅ regra: se template usa {{link_pagamento}}, NÃO anexa pdf
                 template_has_link = ("{{link_pagamento}}" in (tpl.assunto or "")) or ("{{link_pagamento}}" in (tpl.corpo_html or ""))
                 should_attach = bool(bank_slip_url) and (not template_has_link)
 
-                # guarda pro EmailLog final
                 bank_slip_url_for_log = str(bank_slip_url) if bank_slip_url else None
                 should_attach_for_log = bool(should_attach)
 
-                # 3) atualiza cobrança local com retorno do Asaas
                 ch.asaas_payment_id = asaas_payment_id or None
                 ch.status = str(payment.get("status") or "PENDING")
                 ch.invoice_url = str(invoice_url) if invoice_url else None
@@ -1073,11 +1000,9 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
             campaign_run_id=run.id,
         )
 
-        # ✅ NOVO: worker vai anexar PDF SOMENTE se essa flag for true
         if hasattr(log, "should_attach_pdf"):
             log.should_attach_pdf = bool(is_cobranca and emitir_boletos and should_attach_for_log)
 
-        # ✅ NOVO: URL do bankSlipUrl (do Asaas) pro worker baixar e anexar
         if hasattr(log, "asaas_bank_slip_url"):
             log.asaas_bank_slip_url = (
                 str(bank_slip_url_for_log) if (getattr(log, "should_attach_pdf", False) and bank_slip_url_for_log) else None
@@ -1149,10 +1074,6 @@ def get_campaign_stats(company_id: str, campaign_id: str, db: Session = Depends(
     out.update({"campaign_id": str(camp.id), "campaign_status": camp.status})
     return out
 
-
-# =========================
-# PAUSE / RESUME / CANCEL
-# =========================
 
 @router.post("/{campaign_id}/pause", operation_id="campaigns_pause")
 def pause_campaign(company_id: str, campaign_id: str, db: Session = Depends(get_db)):

@@ -87,18 +87,40 @@ def _sanitize_cpf_cnpj(val: Any) -> Optional[str]:
 
 
 def _normalize_product(item: Dict[str, Any]) -> Dict[str, Any]:
+    raw_category = _pick(item, "category", "category_name")
+    category_value = None
+
+    if isinstance(raw_category, dict):
+        category_value = (
+            raw_category.get("name")
+            or raw_category.get("title")
+            or raw_category.get("id")
+        )
+    elif raw_category is not None:
+        category_value = str(raw_category).strip() or None
+
+    raw_active = _pick(item, "active", "is_active")
+    active_value = None
+    if isinstance(raw_active, bool):
+        active_value = raw_active
+    elif raw_active is not None:
+        s = str(raw_active).strip().lower()
+        if s in {"true", "1", "yes", "sim", "active"}:
+            active_value = True
+        elif s in {"false", "0", "no", "nao", "não", "inactive"}:
+            active_value = False
+
     return {
         "cakto_product_id": str(_pick(item, "id", "_id", "product_id") or "").strip(),
-        "name": _pick(item, "name", "title"),
-        "product_type": _pick(item, "type", "product_type"),
-        "status": _pick(item, "status"),
-        "category": _pick(item, "category", "category_name"),
+        "name": str(_pick(item, "name", "title") or "").strip() or None,
+        "product_type": str(_pick(item, "type", "product_type") or "").strip() or None,
+        "status": str(_pick(item, "status") or "").strip() or None,
+        "category": category_value,
         "price": _to_decimal(_pick(item, "price", "amount", "value")),
-        "currency": _pick(item, "currency"),
-        "active": _pick(item, "active", "is_active"),
+        "currency": str(_pick(item, "currency") or "").strip() or None,
+        "active": active_value,
         "raw_payload": item,
     }
-
 
 def _normalize_order(item: Dict[str, Any]) -> Dict[str, Any]:
     customer = item.get("customer") or {}

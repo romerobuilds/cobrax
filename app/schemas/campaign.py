@@ -44,20 +44,14 @@ def _parse_weekdays(v: Any) -> Optional[List[int]]:
     return items or None
 
 
-# =============================
-# CREATE
-# =============================
 class CampaignCreate(BaseModel):
     name: str
     template_id: UUID
-    mode: str = Field(default="selected")  # selected | all | upload
+    mode: str = Field(default="selected")  # selected | all | upload | cakto_customers
     context: Dict[str, Any] = Field(default_factory=dict)
     rate_per_min: int = 15
-
-    # LEGACY: one-shot scheduling
     scheduled_at: Optional[datetime] = None
 
-    # NOVO: cobrança / boletos
     is_cobranca: bool = False
     emitir_boletos: bool = False
     anexar_pdf: bool = False
@@ -75,21 +69,15 @@ class CampaignCreate(BaseModel):
         return _as_utc(v)
 
 
-# =============================
-# UPDATE
-# =============================
 class CampaignUpdate(BaseModel):
     name: Optional[str] = None
     template_id: Optional[UUID] = None
-    status: Optional[str] = None  # draft | scheduled | ready | running | done | ...
+    status: Optional[str] = None
     mode: Optional[str] = None
     context: Optional[Dict[str, Any]] = None
     rate_per_min: Optional[int] = None
-
-    # LEGACY
     scheduled_at: Optional[datetime] = None
 
-    # NOVO: cobrança / boletos
     is_cobranca: Optional[bool] = None
     emitir_boletos: Optional[bool] = None
     anexar_pdf: Optional[bool] = None
@@ -107,9 +95,6 @@ class CampaignUpdate(BaseModel):
         return _as_utc(v)
 
 
-# =============================
-# OUTPUT (Campaign)
-# =============================
 class CampaignOut(BaseModel):
     id: UUID
     company_id: UUID
@@ -119,13 +104,9 @@ class CampaignOut(BaseModel):
     mode: str
     context: Dict[str, Any]
     rate_per_min: int
-
-    # LEGACY
     scheduled_at: Optional[datetime] = None
-
     created_at: datetime
 
-    # NOVO: schedule/recorrência (Fase C+)
     is_schedule_enabled: bool = False
     start_at: Optional[datetime] = None
     next_run_at: Optional[datetime] = None
@@ -137,7 +118,6 @@ class CampaignOut(BaseModel):
     repeat_weekdays: Optional[List[int]] = None
     timezone: str = "America/Sao_Paulo"
 
-    # NOVO: cobrança / boletos
     is_cobranca: bool = False
     emitir_boletos: bool = False
     anexar_pdf: bool = False
@@ -155,12 +135,9 @@ class CampaignOut(BaseModel):
         return _parse_weekdays(v)
 
     class Config:
-        from_attributes = True  # Pydantic v2
+        from_attributes = True
 
 
-# =============================
-# TARGETS
-# =============================
 class CampaignTargetAddSelected(BaseModel):
     client_ids: List[UUID] = Field(default_factory=list)
     payload: Dict[str, Any] = Field(default_factory=dict)
@@ -171,9 +148,6 @@ class CampaignTargetAddEmails(BaseModel):
     payload: Dict[str, Any] = Field(default_factory=dict)
 
 
-# =============================
-# RUN OUTPUT
-# =============================
 class CampaignRunOut(BaseModel):
     id: UUID
     campaign_id: UUID
@@ -191,9 +165,6 @@ class CampaignRunOut(BaseModel):
         from_attributes = True
 
 
-# =============================
-# SCHEDULE (Advanced)
-# =============================
 class CampaignScheduleIn(BaseModel):
     is_enabled: bool = True
     start_at: Optional[datetime] = None
@@ -243,18 +214,14 @@ class CampaignScheduleIn(BaseModel):
 
 class CampaignScheduleOut(BaseModel):
     is_schedule_enabled: bool
-
     start_at: Optional[datetime] = None
     next_run_at: Optional[datetime] = None
     end_at: Optional[datetime] = None
-
     max_occurrences: Optional[int] = None
     occurrences: int
-
     repeat_type: RepeatType
     repeat_every: int
     repeat_weekdays: Optional[List[int]] = None
-
     timezone: str
 
     @field_validator("start_at", "next_run_at", "end_at", mode="after")

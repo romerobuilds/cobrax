@@ -13,9 +13,7 @@ class ClientCreate(BaseModel):
     nome: str
     email: EmailStr
     telefone: Optional[str] = None
-
     cpf_cnpj: Optional[str] = None
-
     is_mensalista: Optional[bool] = False
     saldo_aberto: Optional[Decimal] = Decimal("0.00")
 
@@ -24,9 +22,7 @@ class ClientUpdate(BaseModel):
     nome: Optional[str] = None
     email: Optional[EmailStr] = None
     telefone: Optional[str] = None
-
     cpf_cnpj: Optional[str] = None
-
     is_mensalista: Optional[bool] = None
     saldo_aberto: Optional[Decimal] = None
 
@@ -43,7 +39,6 @@ class ClientPublic(BaseModel):
     created_at: datetime
 
     cpf_cnpj: Optional[str] = None
-
     is_mensalista: bool
     saldo_aberto: Decimal
 

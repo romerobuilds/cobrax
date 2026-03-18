@@ -20,15 +20,10 @@ class Client(Base):
     email = Column(String, nullable=False)
     telefone = Column(String, nullable=True)
 
-    # ✅ cobrança/asaas
+    # cobrança / asaas
     cpf_cnpj = Column(String, nullable=True)
 
-    # ✅ origem / integrações
-    source_system = Column(String, nullable=True)          # ex: CAKTO
-    source_external_ref = Column(String, nullable=True)    # ex: order_id / customer ref
-    last_order_at = Column(DateTime(timezone=True), nullable=True)
-
-    # (opcionais - ajudam muito na emissão e em outras integrações)
+    # opcionais
     endereco = Column(String, nullable=True)
     endereco_numero = Column(String, nullable=True)
     complemento = Column(String, nullable=True)
@@ -37,9 +32,14 @@ class Client(Base):
     estado = Column(String, nullable=True)
     cep = Column(String, nullable=True)
 
-    # ✅ seus campos atuais
+    # campos atuais
     is_mensalista = Column(Boolean, nullable=False, server_default="false")
     saldo_aberto = Column(Numeric(12, 2), nullable=False, server_default="0")
+
+    # origem / integrações
+    source_system = Column(String, nullable=True, index=True)
+    source_external_ref = Column(String, nullable=True)
+    last_order_at = Column(DateTime(timezone=True), nullable=True)
 
     owner_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     owner = relationship("User", back_populates="clients")

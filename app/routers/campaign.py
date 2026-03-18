@@ -590,6 +590,47 @@ def add_targets_all(company_id: str, campaign_id: str, db: Session = Depends(get
     return {"ok": True, "added": int(added)}
 
 
+@router.post("/{campaign_id}/targets/cakto-customers", operation_id="campaigns_targets_cakto_customers_add")
+def add_targets_cakto_customers(company_id: str, campaign_id: str, db: Session = Depends(get_db)):
+    camp = _ensure_campaign_company(db, company_id, campaign_id)
+
+    clients = (
+        db.query(Client)
+        .filter(Client.company_id == company_id)
+        .filter(func.upper(func.coalesce(Client.source_system, "")) == "CAKTO")
+        .all()
+    )
+
+    added = 0
+    for c in clients:
+        exists = (
+            db.query(CampaignTarget)
+            .filter(CampaignTarget.campaign_id == camp.id, CampaignTarget.client_id == c.id)
+            .first()
+        )
+        if exists:
+            continue
+
+        payload: Dict[str, Any] = {}
+        if getattr(c, "last_order_at", None):
+            try:
+                payload["last_order_at"] = c.last_order_at.isoformat()
+            except Exception:
+                pass
+
+        t = CampaignTarget(
+            campaign_id=camp.id,
+            client_id=c.id,
+            email=None,
+            payload=payload,
+        )
+        db.add(t)
+        added += 1
+
+    db.commit()
+    return {"ok": True, "added": int(added)}
+
+
 @router.post("/{campaign_id}/targets/emails", operation_id="campaigns_targets_emails_add")
 def add_targets_emails(
     company_id: str,
@@ -803,6 +844,15 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                 ctx.setdefault("nome", client_obj.nome)
             if getattr(client_obj, "email", None) is not None:
                 ctx.setdefault("email", client_obj.email)
+            if getattr(client_obj, "source_system", None) is not None:
+                ctx.setdefault("source_system", client_obj.source_system)
+            if getattr(client_obj, "source_external_ref", None) is not None:
+                ctx.setdefault("source_external_ref", client_obj.source_external_ref)
+            if getattr(client_obj, "last_order_at", None) is not None:
+                try:
+                    ctx.setdefault("last_order_at", client_obj.last_order_at.isoformat())
+                except Exception:
+                    pass
         else:
             to_email = t.email
 
@@ -819,7 +869,7 @@ def start_campaign_run(company_id: str, campaign_id: str, db: Session = Depends(
                     to_email=to_email,
                     to_name=to_name,
                     subject_rendered="(cobrança requer cliente)",
-                    body_rendered="Campanha de cobrança exige targets com client_id (modo selected/all).",
+                    body_rendered="Campanha de cobrança exige targets com client_id (modo selected/all/cakto_customers).",
                     error_message="billing requires client_id",
                     attempt_count=0,
                     last_attempt_at=None,

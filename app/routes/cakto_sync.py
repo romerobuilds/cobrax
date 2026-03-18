@@ -12,8 +12,13 @@ from app.core.deps import get_company_for_current_user
 from app.database_.database import get_db
 from app.models.cakto_order import CaktoOrder
 from app.models.cakto_product import CaktoProduct
+from app.models.client import Client
 from app.models.company import Company
-from app.schemas.cakto_sync import CaktoOverviewOut, CaktoSyncResultOut
+from app.schemas.cakto_sync import (
+    CaktoOverviewOut,
+    CaktoSyncResultOut,
+    CaktoCustomerSyncResultOut,
+)
 from app.services.cakto_client import get_access_token, list_all_orders, list_all_products
 
 router = APIRouter(
@@ -70,6 +75,17 @@ def _pick(d: Dict[str, Any], *keys: str) -> Any:
     return None
 
 
+def _sanitize_cpf_cnpj(val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    s = "".join(ch for ch in str(val).strip() if ch.isdigit())
+    if not s:
+        return None
+    if len(s) not in (11, 14):
+        return None
+    return s
+
+
 def _normalize_product(item: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "cakto_product_id": str(_pick(item, "id", "_id", "product_id") or "").strip(),
@@ -96,9 +112,9 @@ def _normalize_order(item: Dict[str, Any]) -> Dict[str, Any]:
         ).strip()
         or None,
         "customer_name": _pick(customer, "name", "full_name"),
-        "customer_email": _pick(customer, "email"),
+        "customer_email": (_pick(customer, "email") or "").strip().lower() or None,
         "customer_phone": _pick(customer, "phone", "telefone"),
-        "doc_number": _pick(customer, "docNumber", "document", "cpf_cnpj"),
+        "doc_number": _sanitize_cpf_cnpj(_pick(customer, "docNumber", "document", "cpf_cnpj")),
         "status": _pick(item, "status"),
         "payment_method": _pick(item, "paymentMethod", "payment_method"),
         "amount": _to_decimal(_pick(item, "amount", "price", "value", "total")),
@@ -163,46 +179,46 @@ def sync_cakto_products(
         updated = 0
 
         for raw_item in result["items"]:
-          norm = _normalize_product(raw_item)
-          external_id = norm["cakto_product_id"]
-          if not external_id:
-              continue
+            norm = _normalize_product(raw_item)
+            external_id = norm["cakto_product_id"]
+            if not external_id:
+                continue
 
-          existing = (
-              db.query(CaktoProduct)
-              .filter(
-                  CaktoProduct.company_id == company_id,
-                  CaktoProduct.cakto_product_id == external_id,
-              )
-              .first()
-          )
+            existing = (
+                db.query(CaktoProduct)
+                .filter(
+                    CaktoProduct.company_id == company_id,
+                    CaktoProduct.cakto_product_id == external_id,
+                )
+                .first()
+            )
 
-          if existing:
-              existing.name = norm["name"]
-              existing.product_type = norm["product_type"]
-              existing.status = norm["status"]
-              existing.category = norm["category"]
-              existing.price = norm["price"]
-              existing.currency = norm["currency"]
-              existing.active = norm["active"]
-              existing.raw_payload = norm["raw_payload"]
-              db.add(existing)
-              updated += 1
-          else:
-              obj = CaktoProduct(
-                  company_id=company_id,
-                  cakto_product_id=external_id,
-                  name=norm["name"],
-                  product_type=norm["product_type"],
-                  status=norm["status"],
-                  category=norm["category"],
-                  price=norm["price"],
-                  currency=norm["currency"],
-                  active=norm["active"],
-                  raw_payload=norm["raw_payload"],
-              )
-              db.add(obj)
-              created += 1
+            if existing:
+                existing.name = norm["name"]
+                existing.product_type = norm["product_type"]
+                existing.status = norm["status"]
+                existing.category = norm["category"]
+                existing.price = norm["price"]
+                existing.currency = norm["currency"]
+                existing.active = norm["active"]
+                existing.raw_payload = norm["raw_payload"]
+                db.add(existing)
+                updated += 1
+            else:
+                obj = CaktoProduct(
+                    company_id=company_id,
+                    cakto_product_id=external_id,
+                    name=norm["name"],
+                    product_type=norm["product_type"],
+                    status=norm["status"],
+                    category=norm["category"],
+                    price=norm["price"],
+                    currency=norm["currency"],
+                    active=norm["active"],
+                    raw_payload=norm["raw_payload"],
+                )
+                db.add(obj)
+                created += 1
 
         company.cakto_last_sync_at = datetime.now(timezone.utc)
         db.add(company)
@@ -323,3 +339,129 @@ def sync_cakto_orders(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=400, detail=f"Falha ao importar pedidos da Cakto: {e}")
+
+
+@router.post("/sync-customers", response_model=CaktoCustomerSyncResultOut, status_code=status.HTTP_200_OK)
+def sync_cakto_customers(
+    company_id: UUID,
+    db: Session = Depends(get_db),
+):
+    company = _get_company_or_404(db, company_id)
+    _ensure_company_cakto(company)
+
+    orders = (
+        db.query(CaktoOrder)
+        .filter(CaktoOrder.company_id == company_id)
+        .order_by(
+            CaktoOrder.order_created_at.desc().nullslast(),
+            CaktoOrder.created_at.desc(),
+        )
+        .all()
+    )
+
+    if not orders:
+        return CaktoCustomerSyncResultOut(
+            ok=True,
+            created=0,
+            updated=0,
+            skipped_no_email=0,
+            skipped_unchanged=0,
+            scanned_orders=0,
+            message="Nenhum pedido da Cakto encontrado para criar clientes",
+        )
+
+    created = 0
+    updated = 0
+    skipped_no_email = 0
+    skipped_unchanged = 0
+
+    seen_emails: set[str] = set()
+
+    for order in orders:
+        email = (order.customer_email or "").strip().lower()
+        if not email:
+            skipped_no_email += 1
+            continue
+
+        if email in seen_emails:
+            continue
+        seen_emails.add(email)
+
+        existing = (
+            db.query(Client)
+            .filter(
+                Client.company_id == company_id,
+                Client.email == email,
+            )
+            .first()
+        )
+
+        customer_name = (order.customer_name or "").strip() or email.split("@")[0]
+        customer_phone = (order.customer_phone or "").strip() or None
+        doc_number = _sanitize_cpf_cnpj(order.doc_number)
+        order_ref = str(order.cakto_order_id or "").strip() or None
+
+        if existing:
+            changed = False
+
+            if not (existing.nome or "").strip() and customer_name:
+                existing.nome = customer_name
+                changed = True
+
+            if not (existing.telefone or "").strip() and customer_phone:
+                existing.telefone = customer_phone
+                changed = True
+
+            if not (existing.cpf_cnpj or "").strip() and doc_number:
+                existing.cpf_cnpj = doc_number
+                changed = True
+
+            if not (existing.source_system or "").strip():
+                existing.source_system = "CAKTO"
+                changed = True
+
+            if order_ref and not (existing.source_external_ref or "").strip():
+                existing.source_external_ref = order_ref
+                changed = True
+
+            if order.order_created_at and (
+                existing.last_order_at is None or order.order_created_at > existing.last_order_at
+            ):
+                existing.last_order_at = order.order_created_at
+                changed = True
+
+            if changed:
+                db.add(existing)
+                updated += 1
+            else:
+                skipped_unchanged += 1
+
+            continue
+
+        new_client = Client(
+            nome=customer_name,
+            email=email,
+            telefone=customer_phone,
+            cpf_cnpj=doc_number,
+            owner_id=company.owner_id,
+            company_id=company_id,
+            is_mensalista=False,
+            saldo_aberto=Decimal("0.00"),
+            source_system="CAKTO",
+            source_external_ref=order_ref,
+            last_order_at=order.order_created_at,
+        )
+        db.add(new_client)
+        created += 1
+
+    db.commit()
+
+    return CaktoCustomerSyncResultOut(
+        ok=True,
+        created=created,
+        updated=updated,
+        skipped_no_email=skipped_no_email,
+        skipped_unchanged=skipped_unchanged,
+        scanned_orders=len(orders),
+        message="Clientes criados/atualizados a partir dos pedidos da Cakto",
+    )

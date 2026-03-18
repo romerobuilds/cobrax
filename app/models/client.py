@@ -21,7 +21,12 @@ class Client(Base):
     telefone = Column(String, nullable=True)
 
     # ✅ cobrança/asaas
-    cpf_cnpj = Column(String, nullable=True)  # salvar só números ou com máscara, tanto faz
+    cpf_cnpj = Column(String, nullable=True)
+
+    # ✅ origem / integrações
+    source_system = Column(String, nullable=True)          # ex: CAKTO
+    source_external_ref = Column(String, nullable=True)    # ex: order_id / customer ref
+    last_order_at = Column(DateTime(timezone=True), nullable=True)
 
     # (opcionais - ajudam muito na emissão e em outras integrações)
     endereco = Column(String, nullable=True)

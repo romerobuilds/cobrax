@@ -15,7 +15,6 @@ from sqlalchemy.exc import IntegrityError
 from app.core.deps import get_current_user, get_company_for_current_user
 from app.database_.database import get_db
 from app.models.client import Client
-from app.models.company import Company
 from app.models.user import User
 from app.schemas.client import ClientCreate, ClientPublic, ClientUpdate
 
@@ -193,7 +192,7 @@ def criar_cliente(
 
     client = Client(
         nome=payload.nome,
-        email=str(payload.email),
+        email=str(payload.email).strip().lower(),
         telefone=payload.telefone,
         cpf_cnpj=_sanitize_cpf_cnpj(getattr(payload, "cpf_cnpj", None)),
         owner_id=user.id,
@@ -238,12 +237,12 @@ def atualizar_cliente(
 ):
     client = _get_client_or_404(db, company_id, client_id)
 
-    if payload.email and str(payload.email) != client.email:
+    if payload.email and str(payload.email).strip().lower() != str(client.email).strip().lower():
         existe = (
             db.query(Client)
             .filter(
                 Client.company_id == company_id,
-                Client.email == str(payload.email),
+                Client.email == str(payload.email).strip().lower(),
                 Client.id != client.id,
             )
             .first()
@@ -254,7 +253,7 @@ def atualizar_cliente(
     if payload.nome is not None:
         client.nome = payload.nome
     if payload.email is not None:
-        client.email = str(payload.email)
+        client.email = str(payload.email).strip().lower()
     if payload.telefone is not None:
         client.telefone = payload.telefone
 
@@ -335,7 +334,7 @@ async def upload_clients_file(
 
     for idx, row in enumerate(rows, start=1):
         email_val = _find_value_ci(row, email_col)
-        email = (email_val or "").strip()
+        email = (email_val or "").strip().lower()
         if not email:
             skipped_no_email += 1
             continue

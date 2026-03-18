@@ -14,10 +14,8 @@ class ClientCreate(BaseModel):
     email: EmailStr
     telefone: Optional[str] = None
 
-    # ✅ novo
-    cpf_cnpj: Optional[str] = None  # pode vir só dígitos
+    cpf_cnpj: Optional[str] = None
 
-    # ✅ campos existentes
     is_mensalista: Optional[bool] = False
     saldo_aberto: Optional[Decimal] = Decimal("0.00")
 
@@ -27,10 +25,8 @@ class ClientUpdate(BaseModel):
     email: Optional[EmailStr] = None
     telefone: Optional[str] = None
 
-    # ✅ novo
-    cpf_cnpj: Optional[str] = None  # pode vir só dígitos
+    cpf_cnpj: Optional[str] = None
 
-    # ✅ existentes
     is_mensalista: Optional[bool] = None
     saldo_aberto: Optional[Decimal] = None
 
@@ -46,12 +42,14 @@ class ClientPublic(BaseModel):
     telefone: Optional[str] = None
     created_at: datetime
 
-    # ✅ novo no response
     cpf_cnpj: Optional[str] = None
 
-    # ✅ existentes
     is_mensalista: bool
     saldo_aberto: Decimal
+
+    source_system: Optional[str] = None
+    source_external_ref: Optional[str] = None
+    last_order_at: Optional[datetime] = None
 
 
 class ClientUploadResult(BaseModel):

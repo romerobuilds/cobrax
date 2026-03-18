@@ -17,3 +17,13 @@ class CaktoSyncResultOut(BaseModel):
     updated: int = 0
     pages: int = 0
     message: str = ""
+
+
+class CaktoCustomerSyncResultOut(BaseModel):
+    ok: bool = True
+    created: int = 0
+    updated: int = 0
+    skipped_no_email: int = 0
+    skipped_unchanged: int = 0
+    scanned_orders: int = 0
+    message: str = ""

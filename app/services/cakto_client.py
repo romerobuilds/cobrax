@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -25,11 +25,6 @@ def get_access_token(
     client_secret: str,
     timeout: int = 20,
 ) -> Dict[str, Any]:
-    """
-    Troca client_id + client_secret por access_token na Cakto.
-    Documentação oficial:
-    POST https://api.cakto.com.br/public_api/token/
-    """
     client_id = str(client_id or "").strip()
     client_secret = str(client_secret or "").strip()
 
@@ -67,10 +62,6 @@ def test_credentials(
     client_id: str,
     client_secret: str,
 ) -> Dict[str, Any]:
-    """
-    Valida credenciais obtendo token OAuth2.
-    Não depende de escopos específicos além dos da própria chave.
-    """
     token_data = get_access_token(client_id=client_id, client_secret=client_secret)
 
     return {
@@ -94,16 +85,28 @@ def build_auth_headers(access_token: str) -> Dict[str, str]:
     }
 
 
-def list_products(
+def _extract_items(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+
+    if not isinstance(payload, dict):
+        return []
+
+    for key in ("results", "items", "data", "rows"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [x for x in value if isinstance(x, dict)]
+
+    return []
+
+
+def list_products_page(
     access_token: str,
     *,
     page: int = 1,
-    limit: int = 20,
+    limit: int = 100,
     timeout: int = 20,
 ) -> Dict[str, Any]:
-    """
-    Helper já pronto para a próxima fase.
-    """
     resp = requests.get(
         f"{CAKTO_API_BASE}/public_api/products/",
         headers=build_auth_headers(access_token),
@@ -114,17 +117,14 @@ def list_products(
     return resp.json() or {}
 
 
-def list_orders(
+def list_orders_page(
     access_token: str,
     *,
     page: int = 1,
-    limit: int = 20,
+    limit: int = 100,
     timeout: int = 20,
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    Helper já pronto para a próxima fase.
-    """
     final_params: Dict[str, Any] = {"page": page, "limit": limit}
     if params:
         final_params.update(params)
@@ -137,3 +137,60 @@ def list_orders(
     )
     _raise_for_status_with_body(resp)
     return resp.json() or {}
+
+
+def list_all_products(
+    access_token: str,
+    *,
+    page_size: int = 100,
+    max_pages: int = 30,
+) -> Dict[str, Any]:
+    items: List[Dict[str, Any]] = []
+    pages = 0
+
+    for page in range(1, max_pages + 1):
+        payload = list_products_page(access_token, page=page, limit=page_size)
+        rows = _extract_items(payload)
+        pages += 1
+
+        if not rows:
+            break
+
+        items.extend(rows)
+
+        if len(rows) < page_size:
+            break
+
+    return {
+        "items": items,
+        "pages": pages,
+    }
+
+
+def list_all_orders(
+    access_token: str,
+    *,
+    page_size: int = 100,
+    max_pages: int = 30,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    items: List[Dict[str, Any]] = []
+    pages = 0
+
+    for page in range(1, max_pages + 1):
+        payload = list_orders_page(access_token, page=page, limit=page_size, params=params)
+        rows = _extract_items(payload)
+        pages += 1
+
+        if not rows:
+            break
+
+        items.extend(rows)
+
+        if len(rows) < page_size:
+            break
+
+    return {
+        "items": items,
+        "pages": pages,
+    }

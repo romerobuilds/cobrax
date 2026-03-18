@@ -12,6 +12,7 @@ from app.models.billing_charge import BillingCharge
 from app.models.company_user import CompanyUser
 from app.models.cakto_product import CaktoProduct
 from app.models.cakto_order import CaktoOrder
+from app.models.cakto_automation import CaktoAutomation
 
 from app.models import user, company, client, email_template
 
@@ -35,6 +36,7 @@ from app.routes.dashboard import router as dashboard_router
 from app.routes.asaas_settings import router as asaas_settings_router
 from app.routes.cakto_settings import router as cakto_settings_router
 from app.routes.cakto_sync import router as cakto_sync_router
+from app.routes.cakto_automations import router as cakto_automations_router
 
 app = FastAPI(
     title="COBRAX",
@@ -81,3 +83,4 @@ app.include_router(billing_router)
 app.include_router(asaas_settings_router)
 app.include_router(cakto_settings_router)
 app.include_router(cakto_sync_router)
+app.include_router(cakto_automations_router)

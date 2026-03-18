@@ -12,8 +12,8 @@ DATABASE_URL = os.getenv(
 
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,          # <- testa conexão antes de usar
-    pool_recycle=1800,           # <- recicla conexões velhas (30min)
+    pool_pre_ping=True,
+    pool_recycle=1800,
     pool_size=5,
     max_overflow=10,
     connect_args={"connect_timeout": 5},
@@ -28,13 +28,3 @@ def get_db():
         yield db
     finally:
         db.close()
-
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,    # testa a conexão antes de usar
-    pool_recycle=1800,     # recicla conexão velha (30 min)
-    pool_size=5,
-    max_overflow=10,
-)
-
-

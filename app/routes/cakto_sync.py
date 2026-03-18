@@ -122,6 +122,7 @@ def _normalize_product(item: Dict[str, Any]) -> Dict[str, Any]:
         "raw_payload": item,
     }
 
+
 def _normalize_order(item: Dict[str, Any]) -> Dict[str, Any]:
     customer = item.get("customer") or {}
     product = item.get("product") or {}
@@ -150,6 +151,124 @@ def _normalize_order(item: Dict[str, Any]) -> Dict[str, Any]:
         "refunded_at": _parse_dt(_pick(item, "refundedAt", "refunded_at")),
         "order_created_at": _parse_dt(_pick(item, "createdAt", "created_at")),
         "raw_payload": item,
+    }
+
+
+def sync_customers_from_orders_query(
+    *,
+    db: Session,
+    company_id: UUID,
+    company: Company,
+    orders_query,
+):
+    orders = (
+        orders_query.order_by(
+            CaktoOrder.order_created_at.desc().nullslast(),
+            CaktoOrder.created_at.desc(),
+        ).all()
+    )
+
+    if not orders:
+        return {
+            "created": 0,
+            "updated": 0,
+            "skipped_no_email": 0,
+            "skipped_unchanged": 0,
+            "scanned_orders": 0,
+        }
+
+    created = 0
+    updated = 0
+    skipped_no_email = 0
+    skipped_unchanged = 0
+
+    seen_emails: set[str] = set()
+
+    for order in orders:
+        email = (order.customer_email or "").strip().lower()
+        if not email:
+            skipped_no_email += 1
+            continue
+
+        if email in seen_emails:
+            continue
+        seen_emails.add(email)
+
+        existing = (
+            db.query(Client)
+            .filter(
+                Client.company_id == company_id,
+                Client.email == email,
+            )
+            .first()
+        )
+
+        customer_name = (order.customer_name or "").strip() or email.split("@")[0]
+        customer_phone = (order.customer_phone or "").strip() or None
+        doc_number = _sanitize_cpf_cnpj(order.doc_number)
+        order_ref = str(order.cakto_order_id or "").strip() or None
+
+        if existing:
+            changed = False
+
+            if not (existing.nome or "").strip() and customer_name:
+                existing.nome = customer_name
+                changed = True
+
+            if not (existing.telefone or "").strip() and customer_phone:
+                existing.telefone = customer_phone
+                changed = True
+
+            if not (existing.cpf_cnpj or "").strip() and doc_number:
+                existing.cpf_cnpj = doc_number
+                changed = True
+
+            if hasattr(existing, "source_system") and not (existing.source_system or "").strip():
+                existing.source_system = "CAKTO"
+                changed = True
+
+            if hasattr(existing, "source_external_ref") and order_ref and not (existing.source_external_ref or "").strip():
+                existing.source_external_ref = order_ref
+                changed = True
+
+            if hasattr(existing, "last_order_at") and order.order_created_at and (
+                existing.last_order_at is None or order.order_created_at > existing.last_order_at
+            ):
+                existing.last_order_at = order.order_created_at
+                changed = True
+
+            if changed:
+                db.add(existing)
+                updated += 1
+            else:
+                skipped_unchanged += 1
+
+            continue
+
+        new_client = Client(
+            nome=customer_name,
+            email=email,
+            telefone=customer_phone,
+            cpf_cnpj=doc_number,
+            owner_id=company.owner_id,
+            company_id=company_id,
+            is_mensalista=False,
+            saldo_aberto=Decimal("0.00"),
+            source_system="CAKTO" if hasattr(Client, "source_system") else None,
+            source_external_ref=order_ref if hasattr(Client, "source_external_ref") else None,
+            last_order_at=order.order_created_at if hasattr(Client, "last_order_at") else None,
+        )
+        db.add(new_client)
+        created += 1
+
+    db.commit()
+
+    return {
+        "created": created,
+        "updated": updated,
+        "skipped_no_email": skipped_no_email,
+        "skipped_unchanged": skipped_unchanged,
+        "scanned_orders": len(orders),
     }
 
 
@@ -371,119 +490,20 @@ def sync_cakto_customers(
     company = _get_company_or_404(db, company_id)
     _ensure_company_cakto(company)
 
-    orders = (
-        db.query(CaktoOrder)
-        .filter(CaktoOrder.company_id == company_id)
-        .order_by(
-            CaktoOrder.order_created_at.desc().nullslast(),
-            CaktoOrder.created_at.desc(),
-        )
-        .all()
+    orders_query = db.query(CaktoOrder).filter(CaktoOrder.company_id == company_id)
+    result = sync_customers_from_orders_query(
+        db=db,
+        company_id=company_id,
+        company=company,
+        orders_query=orders_query,
     )
-
-    if not orders:
-        return CaktoCustomerSyncResultOut(
-            ok=True,
-            created=0,
-            updated=0,
-            skipped_no_email=0,
-            skipped_unchanged=0,
-            scanned_orders=0,
-            message="Nenhum pedido da Cakto encontrado para criar clientes",
-        )
-
-    created = 0
-    updated = 0
-    skipped_no_email = 0
-    skipped_unchanged = 0
-
-    seen_emails: set[str] = set()
-
-    for order in orders:
-        email = (order.customer_email or "").strip().lower()
-        if not email:
-            skipped_no_email += 1
-            continue
-
-        if email in seen_emails:
-            continue
-        seen_emails.add(email)
-
-        existing = (
-            db.query(Client)
-            .filter(
-                Client.company_id == company_id,
-                Client.email == email,
-            )
-            .first()
-        )
-
-        customer_name = (order.customer_name or "").strip() or email.split("@")[0]
-        customer_phone = (order.customer_phone or "").strip() or None
-        doc_number = _sanitize_cpf_cnpj(order.doc_number)
-        order_ref = str(order.cakto_order_id or "").strip() or None
-
-        if existing:
-            changed = False
-
-            if not (existing.nome or "").strip() and customer_name:
-                existing.nome = customer_name
-                changed = True
-
-            if not (existing.telefone or "").strip() and customer_phone:
-                existing.telefone = customer_phone
-                changed = True
-
-            if not (existing.cpf_cnpj or "").strip() and doc_number:
-                existing.cpf_cnpj = doc_number
-                changed = True
-
-            if not (existing.source_system or "").strip():
-                existing.source_system = "CAKTO"
-                changed = True
-
-            if order_ref and not (existing.source_external_ref or "").strip():
-                existing.source_external_ref = order_ref
-                changed = True
-
-            if order.order_created_at and (
-                existing.last_order_at is None or order.order_created_at > existing.last_order_at
-            ):
-                existing.last_order_at = order.order_created_at
-                changed = True
-
-            if changed:
-                db.add(existing)
-                updated += 1
-            else:
-                skipped_unchanged += 1
-
-            continue
-
-        new_client = Client(
-            nome=customer_name,
-            email=email,
-            telefone=customer_phone,
-            cpf_cnpj=doc_number,
-            owner_id=company.owner_id,
-            company_id=company_id,
-            is_mensalista=False,
-            saldo_aberto=Decimal("0.00"),
-            source_system="CAKTO",
-            source_external_ref=order_ref,
-            last_order_at=order.order_created_at,
-        )
-        db.add(new_client)
-        created += 1
-
-    db.commit()
 
     return CaktoCustomerSyncResultOut(
         ok=True,
-        created=created,
-        updated=updated,
-        skipped_no_email=skipped_no_email,
-        skipped_unchanged=skipped_unchanged,
-        scanned_orders=len(orders),
+        created=result["created"],
+        updated=result["updated"],
+        skipped_no_email=result["skipped_no_email"],
+        skipped_unchanged=result["skipped_unchanged"],
+        scanned_orders=result["scanned_orders"],
         message="Clientes criados/atualizados a partir dos pedidos da Cakto",
     )

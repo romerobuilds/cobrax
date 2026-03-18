@@ -48,6 +48,15 @@ class Company(Base):
     asaas_api_key = Column(String, nullable=True)
     asaas_base_url = Column(String, nullable=True)
 
+    # =========================
+    # CAKTO (por empresa)
+    # =========================
+    cakto_client_id = Column(String, nullable=True)
+    cakto_client_secret = Column(String, nullable=True)
+    cakto_enabled = Column(Boolean, nullable=False, default=False)
+    cakto_connected_at = Column(DateTime(timezone=True), nullable=True)
+    cakto_last_sync_at = Column(DateTime(timezone=True), nullable=True)
+
     clients = relationship(
         "Client",
         back_populates="company",

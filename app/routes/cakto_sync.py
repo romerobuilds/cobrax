@@ -388,6 +388,10 @@ def sync_cakto_products(
             created=created,
             updated=updated,
             pages=int(result["pages"]),
+            automation_runs=0,
+            automation_clients_created=0,
+            automation_clients_updated=0,
+            automation_emails_queued=0,
             message="Produtos da Cakto sincronizados com sucesso",
         )
     except HTTPException:
@@ -417,6 +421,7 @@ def sync_cakto_orders(
 
         created = 0
         updated = 0
+        touched_order_ids = []
 
         for raw_item in result["items"]:
             norm = _normalize_order(raw_item)
@@ -453,6 +458,8 @@ def sync_cakto_orders(
                 existing.order_created_at = norm["order_created_at"]
                 existing.raw_payload = norm["raw_payload"]
                 db.add(existing)
+                db.flush()
+                touched_order_ids.append(existing.id)
                 updated += 1
             else:
                 obj = CaktoOrder(
@@ -478,11 +485,32 @@ def sync_cakto_orders(
                     raw_payload=norm["raw_payload"],
                 )
                 db.add(obj)
+                db.flush()
+                touched_order_ids.append(obj.id)
                 created += 1
 
         company.cakto_last_sync_at = datetime.now(timezone.utc)
         db.add(company)
         db.commit()
+
+        automation_runs = 0
+        automation_clients_created = 0
+        automation_clients_updated = 0
+        automation_emails_queued = 0
+
+        if touched_order_ids:
+            from app.routes.cakto_automations import run_matching_cakto_automations
+
+            auto_result = run_matching_cakto_automations(
+                db=db,
+                company=company,
+                company_id=company_id,
+                order_ids=touched_order_ids,
+            )
+            automation_runs = int(auto_result.get("automation_runs", 0))
+            automation_clients_created = int(auto_result.get("automation_clients_created", 0))
+            automation_clients_updated = int(auto_result.get("automation_clients_updated", 0))
+            automation_emails_queued = int(auto_result.get("automation_emails_queued", 0))
 
         return CaktoSyncResultOut(
             ok=True,
@@ -490,6 +518,10 @@ def sync_cakto_orders(
             created=created,
             updated=updated,
             pages=int(result["pages"]),
+            automation_runs=automation_runs,
+            automation_clients_created=automation_clients_created,
+            automation_clients_updated=automation_clients_updated,
+            automation_emails_queued=automation_emails_queued,
             message="Pedidos da Cakto importados com sucesso",
         )
     except HTTPException:

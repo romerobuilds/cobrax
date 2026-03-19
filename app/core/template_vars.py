@@ -6,7 +6,6 @@ ALLOWED_TEMPLATE_VARS = {
     "telefone",
     "empresa_nome",
     "empresa_email",
-
     "valor",
     "vencimento",
     "numero_fatura",

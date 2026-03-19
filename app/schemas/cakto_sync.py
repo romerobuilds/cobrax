@@ -16,6 +16,12 @@ class CaktoSyncResultOut(BaseModel):
     created: int = 0
     updated: int = 0
     pages: int = 0
+
+    automation_runs: int = 0
+    automation_clients_created: int = 0
+    automation_clients_updated: int = 0
+    automation_emails_queued: int = 0
+
     message: str = ""
 
 

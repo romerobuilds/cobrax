@@ -196,6 +196,128 @@ def _queue_automation_emails(
     return emails_queued
 
 
+def _build_orders_query_for_automation(base_query, automation: CaktoAutomation):
+    q = base_query
+
+    if automation.run_on_status_paid:
+        q = q.filter(CaktoOrder.status.ilike("paid"))
+
+    if (automation.cakto_product_id or "").strip():
+        q = q.filter(CaktoOrder.cakto_product_id == automation.cakto_product_id.strip())
+
+    return q
+
+
+def _run_single_automation(
+    *,
+    db: Session,
+    company: Company,
+    company_id: UUID,
+    automation: CaktoAutomation,
+    base_orders_query,
+):
+    if automation.action_type != "sync_customer":
+        return {
+            "matched_orders": 0,
+            "created": 0,
+            "updated": 0,
+            "skipped_no_email": 0,
+            "skipped_unchanged": 0,
+            "emails_queued": 0,
+        }
+
+    filtered_query = _build_orders_query_for_automation(base_orders_query, automation)
+
+    result = sync_customers_from_orders_query(
+        db=db,
+        company_id=company_id,
+        company=company,
+        orders_query=filtered_query,
+    )
+
+    emails_queued = 0
+    if automation.send_email_after and automation.template_id:
+        tpl = _ensure_template_or_400(db, company_id, automation.template_id)
+        if tpl:
+            emails_queued = _queue_automation_emails(
+                db=db,
+                company=company,
+                company_id=company_id,
+                template=tpl,
+                matched_pairs=result.get("matched_pairs", []),
+            )
+
+    automation.last_run_at = datetime.now(timezone.utc)
+    automation.updated_at = datetime.now(timezone.utc)
+    db.add(automation)
+    db.commit()
+    db.refresh(automation)
+
+    return {
+        "matched_orders": result["scanned_orders"],
+        "created": result["created"],
+        "updated": result["updated"],
+        "skipped_no_email": result["skipped_no_email"],
+        "skipped_unchanged": result["skipped_unchanged"],
+        "emails_queued": emails_queued,
+    }
+
+
+def run_matching_cakto_automations(
+    *,
+    db: Session,
+    company: Company,
+    company_id: UUID,
+    order_ids: list | None = None,
+):
+    automations = (
+        db.query(CaktoAutomation)
+        .filter(
+            CaktoAutomation.company_id == company_id,
+            CaktoAutomation.is_active.is_(True),
+        )
+        .order_by(CaktoAutomation.created_at.asc())
+        .all()
+    )
+
+    if not automations:
+        return {
+            "automation_runs": 0,
+            "automation_clients_created": 0,
+            "automation_clients_updated": 0,
+            "automation_emails_queued": 0,
+        }
+
+    base_orders_query = db.query(CaktoOrder).filter(CaktoOrder.company_id == company_id)
+    if order_ids:
+        base_orders_query = base_orders_query.filter(CaktoOrder.id.in_(order_ids))
+
+    total_runs = 0
+    total_created = 0
+    total_updated = 0
+    total_emails_queued = 0
+
+    for automation in automations:
+        result = _run_single_automation(
+            db=db,
+            company=company,
+            company_id=company_id,
+            automation=automation,
+            base_orders_query=base_orders_query,
+        )
+        total_runs += 1
+        total_created += int(result.get("created", 0))
+        total_updated += int(result.get("updated", 0))
+        total_emails_queued += int(result.get("emails_queued", 0))
+
+    return {
+        "automation_runs": total_runs,
+        "automation_clients_created": total_created,
+        "automation_clients_updated": total_updated,
+        "automation_emails_queued": total_emails_queued,
+    }
+
+
 @router.get("/", response_model=list[CaktoAutomationOut], status_code=status.HTTP_200_OK)
 def list_cakto_automations(
     company_id: UUID,
@@ -312,50 +434,24 @@ def run_cakto_automation_now(
     if not obj.is_active:
         raise HTTPException(status_code=400, detail="Automação está inativa")
 
-    orders_query = db.query(CaktoOrder).filter(CaktoOrder.company_id == company_id)
+    base_orders_query = db.query(CaktoOrder).filter(CaktoOrder.company_id == company_id)
 
-    if obj.run_on_status_paid:
-        orders_query = orders_query.filter(CaktoOrder.status.ilike("paid"))
-
-    if (obj.cakto_product_id or "").strip():
-        orders_query = orders_query.filter(CaktoOrder.cakto_product_id == obj.cakto_product_id.strip())
-
-    if obj.action_type != "sync_customer":
-        raise HTTPException(status_code=400, detail="Ação da automação ainda não suportada")
-
-    result = sync_customers_from_orders_query(
+    result = _run_single_automation(
         db=db,
-        company_id=company_id,
         company=company,
-        orders_query=orders_query,
+        company_id=company_id,
+        automation=obj,
+        base_orders_query=base_orders_query,
     )
-
-    emails_queued = 0
-    if obj.send_email_after and obj.template_id:
-        tpl = _ensure_template_or_400(db, company_id, obj.template_id)
-        if tpl:
-            emails_queued = _queue_automation_emails(
-                db=db,
-                company=company,
-                company_id=company_id,
-                template=tpl,
-                matched_pairs=result.get("matched_pairs", []),
-            )
-
-    obj.last_run_at = datetime.now(timezone.utc)
-    obj.updated_at = datetime.now(timezone.utc)
-    db.add(obj)
-    db.commit()
-    db.refresh(obj)
 
     return CaktoAutomationRunResultOut(
         ok=True,
         automation_id=str(obj.id),
-        matched_orders=result["scanned_orders"],
+        matched_orders=result["matched_orders"],
         created=result["created"],
         updated=result["updated"],
         skipped_no_email=result["skipped_no_email"],
         skipped_unchanged=result["skipped_unchanged"],
-        emails_queued=emails_queued,
+        emails_queued=result["emails_queued"],
         message="Automação executada com sucesso",
     )

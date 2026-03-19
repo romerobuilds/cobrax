@@ -175,12 +175,14 @@ def sync_customers_from_orders_query(
             "skipped_no_email": 0,
             "skipped_unchanged": 0,
             "scanned_orders": 0,
+            "matched_pairs": [],
         }
 
     created = 0
     updated = 0
     skipped_no_email = 0
     skipped_unchanged = 0
+    matched_pairs = []
 
     seen_emails: set[str] = set()
 
@@ -243,6 +245,12 @@ def sync_customers_from_orders_query(
             else:
                 skipped_unchanged += 1
 
+            matched_pairs.append(
+                {
+                    "client_id": existing.id,
+                    "order_id": order.id,
+                }
+            )
             continue
 
         new_client = Client(
@@ -259,7 +267,15 @@ def sync_customers_from_orders_query(
             last_order_at=order.order_created_at if hasattr(Client, "last_order_at") else None,
         )
         db.add(new_client)
+        db.flush()
+
         created += 1
+        matched_pairs.append(
+            {
+                "client_id": new_client.id,
+                "order_id": order.id,
+            }
+        )
 
     db.commit()
 
@@ -269,6 +285,7 @@ def sync_customers_from_orders_query(
         "skipped_no_email": skipped_no_email,
         "skipped_unchanged": skipped_unchanged,
         "scanned_orders": len(orders),
+        "matched_pairs": matched_pairs,
     }
 
 

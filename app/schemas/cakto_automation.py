@@ -19,6 +19,10 @@ class CaktoAutomationCreate(BaseModel):
     cakto_product_id: Optional[str] = None
     run_on_status_paid: bool = True
 
+    # fase 2
+    send_email_after: bool = False
+    template_id: Optional[UUID] = None
+
 
 class CaktoAutomationUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=150)
@@ -27,6 +31,10 @@ class CaktoAutomationUpdate(BaseModel):
     action_type: Optional[CaktoActionType] = None
     cakto_product_id: Optional[str] = None
     run_on_status_paid: Optional[bool] = None
+
+    # fase 2
+    send_email_after: Optional[bool] = None
+    template_id: Optional[UUID] = None
 
 
 class CaktoAutomationOut(BaseModel):
@@ -40,6 +48,10 @@ class CaktoAutomationOut(BaseModel):
     action_type: CaktoActionType
     cakto_product_id: Optional[str] = None
     run_on_status_paid: bool
+
+    send_email_after: bool = False
+    template_id: Optional[UUID] = None
+
     created_at: datetime
     updated_at: datetime
     last_run_at: Optional[datetime] = None
@@ -53,4 +65,5 @@ class CaktoAutomationRunResultOut(BaseModel):
     updated: int = 0
     skipped_no_email: int = 0
     skipped_unchanged: int = 0
+    emails_queued: int = 0
     message: str = ""

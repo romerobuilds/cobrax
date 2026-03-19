@@ -14,13 +14,18 @@ class CaktoAutomation(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
-    company_id = Column(UUID(as_uuid=True), ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True)
+    company_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("companies.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
 
     name = Column(String(150), nullable=False)
 
     is_active = Column(Boolean, nullable=False, server_default="true")
 
-    # Fase 1
+    # Fase 1/2
     event_type = Column(String(50), nullable=False, server_default="order_paid")
     action_type = Column(String(50), nullable=False, server_default="sync_customer")
 
@@ -30,8 +35,18 @@ class CaktoAutomation(Base):
     # regra simples desta fase
     run_on_status_paid = Column(Boolean, nullable=False, server_default="true")
 
+    # Fase 2: envio automático de template
+    send_email_after = Column(Boolean, nullable=False, server_default="false")
+    template_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("email_templates.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     last_run_at = Column(DateTime(timezone=True), nullable=True)
 
     company = relationship("Company")
+    template = relationship("EmailTemplate")

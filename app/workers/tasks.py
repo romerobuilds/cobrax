@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation
 import re
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import func
 from celery.exceptions import Retry
@@ -19,10 +21,16 @@ from app.models.client import Client
 from app.models.billing_charge import BillingCharge
 from app.models.campaign import Campaign
 from app.models.campaign_run import CampaignRun
+from app.models.cakto_order import CaktoOrder
+from app.models.cakto_automation import CaktoAutomation
+from app.models.email_template import EmailTemplate
 
 from app.workers.rate_limiter import throttle_company
 from app.services.mailer import send_smtp_email, EmailAttachment
 from app.services.asaas_client import download_url_as_bytes
+from app.services.cakto_client import get_access_token, list_all_orders
+from app.core.template_vars import build_default_context
+from app.services.template_renderer import render_email_template
 
 
 def _same_utc_day(dt) -> bool:
@@ -109,12 +117,561 @@ def _looks_like_html(s: str) -> bool:
 def _strip_html_simple(html: str) -> str:
     if not html:
         return ""
-    txt = re.sub(r"(?is)<(script|style).?>.?</\1>", "", html)
+    txt = re.sub(r"(?is)<(script|style).*>.*?</\1>", "", html)
     txt = re.sub(r"(?is)<br\s*/?>", "\n", txt)
     txt = re.sub(r"(?is)</p\s*>", "\n\n", txt)
     txt = re.sub(r"(?is)<.*?>", "", txt)
     txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
     return txt
+
+
+def _pick(d: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in d and d.get(key) is not None:
+            return d.get(key)
+    return None
+
+
+def _sanitize_cpf_cnpj(val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    s = "".join(ch for ch in str(val).strip() if ch.isdigit())
+    if not s:
+        return None
+    if len(s) not in (11, 14):
+        return None
+    return s
+
+
+def _to_decimal(value: Any) -> Optional[Decimal]:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value)).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _parse_dt(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    s = s.replace("Z", "+00:00")
+
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _normalize_order(item: Dict[str, Any]) -> Dict[str, Any]:
+    customer = item.get("customer") or {}
+    product = item.get("product") or {}
+    utm = item.get("utm") or {}
+
+    return {
+        "cakto_order_id": str(_pick(item, "id", "_id", "order_id") or "").strip(),
+        "cakto_product_id": str(
+            _pick(product, "id", "_id", "product_id") or _pick(item, "product_id") or ""
+        ).strip() or None,
+        "customer_name": _pick(customer, "name", "full_name"),
+        "customer_email": (_pick(customer, "email") or "").strip().lower() or None,
+        "customer_phone": _pick(customer, "phone", "telefone"),
+        "doc_number": _sanitize_cpf_cnpj(_pick(customer, "docNumber", "document", "cpf_cnpj")),
+        "status": _pick(item, "status"),
+        "payment_method": _pick(item, "paymentMethod", "payment_method"),
+        "amount": _to_decimal(_pick(item, "amount", "price", "value", "total")),
+        "currency": _pick(item, "currency"),
+        "offer_type": _pick(item, "offer_type", "offerType"),
+        "utm_source": _pick(item, "utm_source") or _pick(utm, "source"),
+        "utm_medium": _pick(item, "utm_medium") or _pick(utm, "medium"),
+        "utm_campaign": _pick(item, "utm_campaign") or _pick(utm, "campaign"),
+        "paid_at": _parse_dt(_pick(item, "paidAt", "paid_at")),
+        "canceled_at": _parse_dt(_pick(item, "canceledAt", "canceled_at")),
+        "refunded_at": _parse_dt(_pick(item, "refundedAt", "refunded_at")),
+        "order_created_at": _parse_dt(_pick(item, "createdAt", "created_at")),
+        "raw_payload": item,
+    }
+
+
+def _fmt_money_br(value) -> str | None:
+    if value is None:
+        return None
+    try:
+        dec = Decimal(str(value)).quantize(Decimal("0.01"))
+        s = f"{dec:.2f}".replace(".", ",")
+        return f"R$ {s}"
+    except Exception:
+        return str(value)
+
+
+def _fmt_dt_br(value) -> str | None:
+    if not value:
+        return None
+    try:
+        dt = value
+        if getattr(dt, "tzinfo", None) is None:
+            return dt.strftime("%d/%m/%Y %H:%M")
+        return dt.astimezone(timezone.utc).strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return str(value)
+
+
+def _build_order_context(order: CaktoOrder) -> dict:
+    return {
+        "pedido_id": getattr(order, "cakto_order_id", None),
+        "produto_id": getattr(order, "cakto_product_id", None),
+        "pedido_status": getattr(order, "status", None),
+        "forma_pagamento": getattr(order, "payment_method", None),
+        "valor_pedido": _fmt_money_br(getattr(order, "amount", None)),
+        "valor": _fmt_money_br(getattr(order, "amount", None)),
+        "data_pedido": _fmt_dt_br(getattr(order, "order_created_at", None)),
+        "utm_source": getattr(order, "utm_source", None),
+        "utm_medium": getattr(order, "utm_medium", None),
+        "utm_campaign": getattr(order, "utm_campaign", None),
+        "descricao": getattr(order, "offer_type", None) or "Pedido importado da Cakto",
+    }
+
+
+def _sync_customers_from_orders(
+    *,
+    db,
+    company: Company,
+    company_id,
+    orders: list[CaktoOrder],
+):
+    if not orders:
+        return {
+            "created": 0,
+            "updated": 0,
+            "skipped_no_email": 0,
+            "skipped_unchanged": 0,
+            "scanned_orders": 0,
+            "matched_pairs": [],
+        }
+
+    created = 0
+    updated = 0
+    skipped_no_email = 0
+    skipped_unchanged = 0
+    matched_pairs = []
+
+    seen_emails: set[str] = set()
+
+    for order in orders:
+        email = (order.customer_email or "").strip().lower()
+        if not email:
+            skipped_no_email += 1
+            continue
+
+        if email in seen_emails:
+            continue
+        seen_emails.add(email)
+
+        existing = (
+            db.query(Client)
+            .filter(
+                Client.company_id == company_id,
+                Client.email == email,
+            )
+            .first()
+        )
+
+        customer_name = (order.customer_name or "").strip() or email.split("@")[0]
+        customer_phone = (order.customer_phone or "").strip() or None
+        doc_number = _sanitize_cpf_cnpj(order.doc_number)
+        order_ref = str(order.cakto_order_id or "").strip() or None
+
+        if existing:
+            changed = False
+
+            if not (existing.nome or "").strip() and customer_name:
+                existing.nome = customer_name
+                changed = True
+
+            if not (existing.telefone or "").strip() and customer_phone:
+                existing.telefone = customer_phone
+                changed = True
+
+            if not (existing.cpf_cnpj or "").strip() and doc_number:
+                existing.cpf_cnpj = doc_number
+                changed = True
+
+            if hasattr(existing, "source_system") and not (existing.source_system or "").strip():
+                existing.source_system = "CAKTO"
+                changed = True
+
+            if hasattr(existing, "source_external_ref") and order_ref and not (existing.source_external_ref or "").strip():
+                existing.source_external_ref = order_ref
+                changed = True
+
+            if hasattr(existing, "last_order_at") and order.order_created_at and (
+                existing.last_order_at is None or order.order_created_at > existing.last_order_at
+            ):
+                existing.last_order_at = order.order_created_at
+                changed = True
+
+            if changed:
+                db.add(existing)
+                updated += 1
+            else:
+                skipped_unchanged += 1
+
+            matched_pairs.append(
+                {
+                    "client_id": existing.id,
+                    "order_id": order.id,
+                }
+            )
+            continue
+
+        new_client = Client(
+            nome=customer_name,
+            email=email,
+            telefone=customer_phone,
+            cpf_cnpj=doc_number,
+            owner_id=company.owner_id,
+            company_id=company_id,
+            is_mensalista=False,
+            saldo_aberto=Decimal("0.00"),
+            source_system="CAKTO" if hasattr(Client, "source_system") else None,
+            source_external_ref=order_ref if hasattr(Client, "source_external_ref") else None,
+            last_order_at=order.order_created_at if hasattr(Client, "last_order_at") else None,
+        )
+        db.add(new_client)
+        db.flush()
+
+        created += 1
+        matched_pairs.append(
+            {
+                "client_id": new_client.id,
+                "order_id": order.id,
+            }
+        )
+
+    db.commit()
+
+    return {
+        "created": created,
+        "updated": updated,
+        "skipped_no_email": skipped_no_email,
+        "skipped_unchanged": skipped_unchanged,
+        "scanned_orders": len(orders),
+        "matched_pairs": matched_pairs,
+    }
+
+
+def _queue_automation_emails(
+    *,
+    db,
+    company: Company,
+    company_id,
+    template: EmailTemplate,
+    matched_pairs: list,
+) -> int:
+    queued_log_ids: list[str] = []
+    emails_queued = 0
+    seen_client_ids: set[str] = set()
+
+    for pair in matched_pairs or []:
+        client_id = pair.get("client_id")
+        order_id = pair.get("order_id")
+
+        if not client_id or not order_id:
+            continue
+
+        client_key = str(client_id)
+        if client_key in seen_client_ids:
+            continue
+        seen_client_ids.add(client_key)
+
+        client = (
+            db.query(Client)
+            .filter(
+                Client.company_id == company_id,
+                Client.id == client_id,
+            )
+            .first()
+        )
+        if not client or not (client.email or "").strip():
+            continue
+
+        order = (
+            db.query(CaktoOrder)
+            .filter(
+                CaktoOrder.company_id == company_id,
+                CaktoOrder.id == order_id,
+            )
+            .first()
+        )
+        if not order:
+            continue
+
+        ctx = build_default_context(
+            company=company,
+            client=client,
+            extra=_build_order_context(order),
+        )
+
+        try:
+            rendered = render_email_template(
+                subject_tpl=template.assunto,
+                body_tpl=template.corpo_html,
+                context=ctx,
+            )
+        except Exception:
+            continue
+
+        log = EmailLog(
+            company_id=company_id,
+            client_id=client.id,
+            template_id=template.id,
+            status="PENDING",
+            to_email=client.email,
+            to_name=client.nome,
+            subject_rendered=rendered.subject,
+            body_rendered=rendered.body,
+            error_message=None,
+        )
+        db.add(log)
+        db.flush()
+
+        queued_log_ids.append(str(log.id))
+        emails_queued += 1
+
+    db.commit()
+
+    for log_id in queued_log_ids:
+        send_email_job.delay(log_id)
+
+    return emails_queued
+
+
+def _run_company_cakto_automations(
+    *,
+    db,
+    company: Company,
+    new_order_ids: list,
+) -> Dict[str, Any]:
+    if not new_order_ids:
+        return {
+            "automations_processed": 0,
+            "clients_created": 0,
+            "clients_updated": 0,
+            "emails_queued": 0,
+        }
+
+    automations = (
+        db.query(CaktoAutomation)
+        .filter(
+            CaktoAutomation.company_id == company.id,
+            CaktoAutomation.is_active.is_(True),
+        )
+        .order_by(CaktoAutomation.created_at.asc())
+        .all()
+    )
+
+    if not automations:
+        return {
+            "automations_processed": 0,
+            "clients_created": 0,
+            "clients_updated": 0,
+            "emails_queued": 0,
+        }
+
+    total_created = 0
+    total_updated = 0
+    total_emails = 0
+    processed = 0
+
+    for obj in automations:
+        orders_query = db.query(CaktoOrder).filter(
+            CaktoOrder.company_id == company.id,
+            CaktoOrder.id.in_(new_order_ids),
+        )
+
+        if obj.run_on_status_paid:
+            orders_query = orders_query.filter(CaktoOrder.status.ilike("paid"))
+
+        if (obj.cakto_product_id or "").strip():
+            orders_query = orders_query.filter(CaktoOrder.cakto_product_id == obj.cakto_product_id.strip())
+
+        if obj.action_type != "sync_customer":
+            continue
+
+        matched_orders = orders_query.order_by(
+            CaktoOrder.order_created_at.desc().nullslast(),
+            CaktoOrder.created_at.desc(),
+        ).all()
+
+        result = _sync_customers_from_orders(
+            db=db,
+            company=company,
+            company_id=company.id,
+            orders=matched_orders,
+        )
+
+        total_created += int(result["created"])
+        total_updated += int(result["updated"])
+
+        if obj.send_email_after and obj.template_id:
+            tpl = (
+                db.query(EmailTemplate)
+                .filter(
+                    EmailTemplate.company_id == company.id,
+                    EmailTemplate.id == obj.template_id,
+                )
+                .first()
+            )
+            if tpl:
+                total_emails += _queue_automation_emails(
+                    db=db,
+                    company=company,
+                    company_id=company.id,
+                    template=tpl,
+                    matched_pairs=result.get("matched_pairs", []),
+                )
+
+        obj.last_run_at = datetime.now(timezone.utc)
+        obj.updated_at = datetime.now(timezone.utc)
+        db.add(obj)
+        db.commit()
+
+        processed += 1
+
+    return {
+        "automations_processed": processed,
+        "clients_created": total_created,
+        "clients_updated": total_updated,
+        "emails_queued": total_emails,
+    }
+
+
+def _sync_company_cakto_pipeline(company_id: str) -> Dict[str, Any]:
+    db = SessionLocal()
+    try:
+        company: Company | None = db.query(Company).filter(Company.id == company_id).first()
+        if not company:
+            return {"ok": False, "error": "Empresa não encontrada", "company_id": company_id}
+
+        client_id = (company.cakto_client_id or "").strip()
+        client_secret = (company.cakto_client_secret or "").strip()
+
+        if not bool(getattr(company, "cakto_enabled", False)):
+            return {"ok": True, "skipped": True, "reason": "cakto_disabled", "company_id": company_id}
+
+        if not client_id or not client_secret:
+            return {"ok": True, "skipped": True, "reason": "missing_credentials", "company_id": company_id}
+
+        token_data = get_access_token(client_id=client_id, client_secret=client_secret)
+        access_token = str(token_data.get("access_token") or "").strip()
+
+        result = list_all_orders(access_token, page_size=100, max_pages=20)
+
+        created = 0
+        updated = 0
+        new_order_ids: list = []
+
+        for raw_item in result["items"]:
+            norm = _normalize_order(raw_item)
+            external_id = norm["cakto_order_id"]
+            if not external_id:
+                continue
+
+            existing = (
+                db.query(CaktoOrder)
+                .filter(
+                    CaktoOrder.company_id == company.id,
+                    CaktoOrder.cakto_order_id == external_id,
+                )
+                .first()
+            )
+
+            if existing:
+                existing.cakto_product_id = norm["cakto_product_id"]
+                existing.customer_name = norm["customer_name"]
+                existing.customer_email = norm["customer_email"]
+                existing.customer_phone = norm["customer_phone"]
+                existing.doc_number = norm["doc_number"]
+                existing.status = norm["status"]
+                existing.payment_method = norm["payment_method"]
+                existing.amount = norm["amount"]
+                existing.currency = norm["currency"]
+                existing.offer_type = norm["offer_type"]
+                existing.utm_source = norm["utm_source"]
+                existing.utm_medium = norm["utm_medium"]
+                existing.utm_campaign = norm["utm_campaign"]
+                existing.paid_at = norm["paid_at"]
+                existing.canceled_at = norm["canceled_at"]
+                existing.refunded_at = norm["refunded_at"]
+                existing.order_created_at = norm["order_created_at"]
+                existing.raw_payload = norm["raw_payload"]
+                db.add(existing)
+                updated += 1
+            else:
+                obj = CaktoOrder(
+                    company_id=company.id,
+                    cakto_order_id=external_id,
+                    cakto_product_id=norm["cakto_product_id"],
+                    customer_name=norm["customer_name"],
+                    customer_email=norm["customer_email"],
+                    customer_phone=norm["customer_phone"],
+                    doc_number=norm["doc_number"],
+                    status=norm["status"],
+                    payment_method=norm["payment_method"],
+                    amount=norm["amount"],
+                    currency=norm["currency"],
+                    offer_type=norm["offer_type"],
+                    utm_source=norm["utm_source"],
+                    utm_medium=norm["utm_medium"],
+                    utm_campaign=norm["utm_campaign"],
+                    paid_at=norm["paid_at"],
+                    canceled_at=norm["canceled_at"],
+                    refunded_at=norm["refunded_at"],
+                    order_created_at=norm["order_created_at"],
+                    raw_payload=norm["raw_payload"],
+                )
+                db.add(obj)
+                db.flush()
+                created += 1
+                new_order_ids.append(obj.id)
+
+        company.cakto_last_sync_at = datetime.now(timezone.utc)
+        db.add(company)
+        db.commit()
+
+        automation_result = _run_company_cakto_automations(
+            db=db,
+            company=company,
+            new_order_ids=new_order_ids,
+        )
+
+        return {
+            "ok": True,
+            "company_id": str(company.id),
+            "orders_created": int(created),
+            "orders_updated": int(updated),
+            "pages": int(result["pages"]),
+            "new_orders_for_automation": int(len(new_order_ids)),
+            "automations_processed": int(automation_result["automations_processed"]),
+            "clients_created": int(automation_result["clients_created"]),
+            "clients_updated": int(automation_result["clients_updated"]),
+            "emails_queued": int(automation_result["emails_queued"]),
+        }
+
+    except Exception as e:
+        db.rollback()
+        return {
+            "ok": False,
+            "company_id": company_id,
+            "error": str(e),
+        }
+    finally:
+        db.close()
 
 
 @celery_app.task(
@@ -333,3 +890,44 @@ from app.workers.scheduler import run_due_campaigns
 @celery_app.task(name="campaigns.run_due_campaigns")
 def run_due_campaigns_job():
     return run_due_campaigns(batch_size=25)
+
+
+@celery_app.task(name="cakto.sync_company")
+def sync_cakto_company_job(company_id: str):
+    return _sync_company_cakto_pipeline(company_id)
+
+
+@celery_app.task(name="cakto.sync_all_companies")
+def sync_all_cakto_companies_job():
+    db = SessionLocal()
+    try:
+        companies = (
+            db.query(Company)
+            .filter(Company.cakto_enabled.is_(True))
+            .filter(Company.cakto_client_id.isnot(None))
+            .filter(Company.cakto_client_secret.isnot(None))
+            .all()
+        )
+        company_ids = [str(c.id) for c in companies]
+    finally:
+        db.close()
+
+    results = []
+    ok_count = 0
+    fail_count = 0
+
+    for company_id in company_ids:
+        result = _sync_company_cakto_pipeline(company_id)
+        results.append(result)
+        if result.get("ok"):
+            ok_count += 1
+        else:
+            fail_count += 1
+
+    return {
+        "ok": True,
+        "companies_found": len(company_ids),
+        "companies_ok": ok_count,
+        "companies_failed": fail_count,
+        "results": results,
+    }

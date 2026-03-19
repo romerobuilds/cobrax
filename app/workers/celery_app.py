@@ -24,8 +24,8 @@ celery_app.conf.beat_schedule = {
         "task": "campaigns.run_due_campaigns",
         "schedule": 30.0,
     },
-    "sync-cakto-automations-every-5min": {
+    "sync-cakto-automations-every-1min": {
         "task": "cakto.sync_all_companies",
-        "schedule": 300.0,
+        "schedule": 60.0,
     },
 }

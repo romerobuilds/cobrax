@@ -455,9 +455,9 @@ def _run_company_cakto_automations(
     *,
     db,
     company: Company,
-    new_order_ids: list,
+    trigger_order_ids: list,
 ) -> Dict[str, Any]:
-    if not new_order_ids:
+    if not trigger_order_ids:
         return {
             "automations_processed": 0,
             "clients_created": 0,
@@ -491,7 +491,7 @@ def _run_company_cakto_automations(
     for obj in automations:
         orders_query = db.query(CaktoOrder).filter(
             CaktoOrder.company_id == company.id,
-            CaktoOrder.id.in_(new_order_ids),
+            CaktoOrder.id.in_(trigger_order_ids),
         )
 
         if obj.run_on_status_paid:
@@ -574,7 +574,7 @@ def _sync_company_cakto_pipeline(company_id: str) -> Dict[str, Any]:
 
         created = 0
         updated = 0
-        new_order_ids: list = []
+        trigger_order_ids: list = []
 
         for raw_item in result["items"]:
             norm = _normalize_order(raw_item)
@@ -592,6 +592,9 @@ def _sync_company_cakto_pipeline(company_id: str) -> Dict[str, Any]:
             )
 
             if existing:
+                old_status = str(existing.status or "").strip().lower()
+                new_status = str(norm["status"] or "").strip().lower()
+
                 existing.cakto_product_id = norm["cakto_product_id"]
                 existing.customer_name = norm["customer_name"]
                 existing.customer_email = norm["customer_email"]
@@ -612,6 +615,9 @@ def _sync_company_cakto_pipeline(company_id: str) -> Dict[str, Any]:
                 existing.raw_payload = norm["raw_payload"]
                 db.add(existing)
                 updated += 1
+
+                if old_status != "paid" and new_status == "paid":
+                    trigger_order_ids.append(existing.id)
             else:
                 obj = CaktoOrder(
                     company_id=company.id,
@@ -638,7 +644,7 @@ def _sync_company_cakto_pipeline(company_id: str) -> Dict[str, Any]:
                 db.add(obj)
                 db.flush()
                 created += 1
-                new_order_ids.append(obj.id)
+                trigger_order_ids.append(obj.id)
 
         company.cakto_last_sync_at = datetime.now(timezone.utc)
         db.add(company)
@@ -647,7 +653,7 @@ def _sync_company_cakto_pipeline(company_id: str) -> Dict[str, Any]:
         automation_result = _run_company_cakto_automations(
             db=db,
             company=company,
-            new_order_ids=new_order_ids,
+            trigger_order_ids=trigger_order_ids,
         )
 
         return {
@@ -656,7 +662,7 @@ def _sync_company_cakto_pipeline(company_id: str) -> Dict[str, Any]:
             "orders_created": int(created),
             "orders_updated": int(updated),
             "pages": int(result["pages"]),
-            "new_orders_for_automation": int(len(new_order_ids)),
+            "orders_triggered_for_automation": int(len(trigger_order_ids)),
             "automations_processed": int(automation_result["automations_processed"]),
             "clients_created": int(automation_result["clients_created"]),
             "clients_updated": int(automation_result["clients_updated"]),

@@ -115,12 +115,106 @@ def _action_syncs_customer(action_type: str | None) -> bool:
     return action_type in {"sync_customer", "sync_customer_and_send_email"}
 
 
-def _action_sends_email(action_type: str | None) -> bool:
-    return action_type in {"send_email", "sync_customer_and_send_email"}
+def _action_sends_email(action_type: str | None, send_email_after: bool | None = None) -> bool:
+    return bool(send_email_after) or action_type in {"send_email", "sync_customer_and_send_email"}
 
 
-def _action_requires_template(action_type: str | None) -> bool:
-    return _action_sends_email(action_type)
+def _action_requires_template(action_type: str | None, send_email_after: bool | None = None) -> bool:
+    return _action_sends_email(action_type, send_email_after)
+
+
+def _is_subscription_renewed(order: CaktoOrder) -> bool:
+    raw = getattr(order, "raw_payload", None) or {}
+    offer_type = str(getattr(order, "offer_type", None) or "").strip().lower()
+    status = str(getattr(order, "status", None) or "").strip().lower()
+
+    direct_flags = [
+        raw.get("subscription_renewed"),
+        raw.get("is_subscription_renewed"),
+        raw.get("renewed"),
+        raw.get("isRenewal"),
+        raw.get("renewal"),
+    ]
+    if any(bool(v) for v in direct_flags):
+        return True
+
+    recurrence_number = raw.get("recurrence_number") or raw.get("recurrenceNumber")
+    try:
+        if recurrence_number is not None and int(recurrence_number) > 1:
+            return True
+    except Exception:
+        pass
+
+    text_blob = " ".join(
+        [
+            offer_type,
+            status,
+            str(raw.get("type") or ""),
+            str(raw.get("event") or ""),
+            str(raw.get("billing_type") or ""),
+            str(raw.get("offer_type") or ""),
+            str(raw.get("offerType") or ""),
+            str(raw.get("description") or ""),
+        ]
+    ).lower()
+
+    looks_subscription = any(
+        token in text_blob
+        for token in [
+            "subscription",
+            "assinatura",
+            "recorr",
+            "renew",
+            "renov",
+        ]
+    )
+
+    if looks_subscription and (
+        status == "paid" or getattr(order, "paid_at", None) is not None
+    ):
+        return True
+
+    return False
+
+
+def _event_matches_order(automation: CaktoAutomation, order: CaktoOrder) -> bool:
+    event_type = str(getattr(automation, "event_type", "order_paid") or "order_paid").strip().lower()
+
+    if event_type == "order_created":
+        return True
+
+    if event_type == "order_paid":
+        status = str(getattr(order, "status", None) or "").strip().lower()
+        return status == "paid" or getattr(order, "paid_at", None) is not None
+
+    if event_type == "order_refunded":
+        status = str(getattr(order, "status", None) or "").strip().lower()
+        return status == "refunded" or getattr(order, "refunded_at", None) is not None
+
+    if event_type == "subscription_renewed":
+        return _is_subscription_renewed(order)
+
+    return False
+
+
+def _automation_matches_product(automation: CaktoAutomation, order: CaktoOrder) -> bool:
+    wanted = str(getattr(automation, "cakto_product_id", None) or "").strip()
+    if not wanted:
+        return True
+    return str(getattr(order, "cakto_product_id", None) or "").strip() == wanted
+
+
+def _filter_orders_for_automation(automation: CaktoAutomation, orders: list[CaktoOrder]) -> list[CaktoOrder]:
+    out = []
+
+    for order in orders or []:
+        if not _automation_matches_product(automation, order):
+            continue
+        if not _event_matches_order(automation, order):
+            continue
+        out.append(order)
+
+    return out
 
 
 def _queue_automation_emails_from_orders(
@@ -199,18 +293,6 @@ def _queue_automation_emails_from_orders(
     return emails_queued
 
 
-def _build_orders_query_for_automation(base_query, automation: CaktoAutomation):
-    q = base_query
-
-    if automation.run_on_status_paid:
-        q = q.filter(CaktoOrder.status.ilike("paid"))
-
-    if (automation.cakto_product_id or "").strip():
-        q = q.filter(CaktoOrder.cakto_product_id == automation.cakto_product_id.strip())
-
-    return q
-
-
 def _run_single_automation(
     *,
     db: Session,
@@ -219,12 +301,14 @@ def _run_single_automation(
     automation: CaktoAutomation,
     base_orders_query,
 ):
-    filtered_query = _build_orders_query_for_automation(base_orders_query, automation)
+    candidate_orders = (
+        base_orders_query.order_by(
+            CaktoOrder.order_created_at.desc().nullslast(),
+            CaktoOrder.created_at.desc(),
+        ).all()
+    )
 
-    orders = filtered_query.order_by(
-        CaktoOrder.order_created_at.desc().nullslast(),
-        CaktoOrder.created_at.desc(),
-    ).all()
+    orders = _filter_orders_for_automation(automation, candidate_orders)
 
     matched_orders = len(orders)
     created = 0
@@ -233,19 +317,27 @@ def _run_single_automation(
     skipped_unchanged = 0
     emails_queued = 0
 
-    if automation.action_type == "sync_customer":
+    orders_query = db.query(CaktoOrder).filter(
+        CaktoOrder.company_id == company_id,
+        CaktoOrder.id.in_([o.id for o in orders]),
+    ) if orders else db.query(CaktoOrder).filter(
+        CaktoOrder.company_id == company_id,
+        CaktoOrder.id.in_([]),
+    )
+
+    if _action_syncs_customer(automation.action_type):
         result = sync_customers_from_orders_query(
             db=db,
             company_id=company_id,
             company=company,
-            orders_query=filtered_query,
+            orders_query=orders_query,
         )
         created = int(result["created"])
         updated = int(result["updated"])
         skipped_no_email = int(result["skipped_no_email"])
         skipped_unchanged = int(result["skipped_unchanged"])
 
-    elif automation.action_type == "send_email":
+    if _action_sends_email(automation.action_type, automation.send_email_after):
         tpl = _ensure_template_or_400(db, company_id, automation.template_id)
         if tpl:
             emails_queued = _queue_automation_emails_from_orders(
@@ -255,30 +347,6 @@ def _run_single_automation(
                 template=tpl,
                 orders=orders,
             )
-
-    elif automation.action_type == "sync_customer_and_send_email":
-        result = sync_customers_from_orders_query(
-            db=db,
-            company_id=company_id,
-            company=company,
-            orders_query=filtered_query,
-        )
-        created = int(result["created"])
-        updated = int(result["updated"])
-        skipped_no_email = int(result["skipped_no_email"])
-        skipped_unchanged = int(result["skipped_unchanged"])
-
-        tpl = _ensure_template_or_400(db, company_id, automation.template_id)
-        if tpl:
-            emails_queued = _queue_automation_emails_from_orders(
-                db=db,
-                company=company,
-                company_id=company_id,
-                template=tpl,
-                orders=orders,
-            )
-    else:
-        raise HTTPException(status_code=400, detail="Ação da automação ainda não suportada")
 
     automation.last_run_at = datetime.now(timezone.utc)
     automation.updated_at = datetime.now(timezone.utc)
@@ -376,7 +444,7 @@ def create_cakto_automation(
 
     tpl = _ensure_template_or_400(db, company_id, payload.template_id)
 
-    if _action_requires_template(payload.action_type) and not tpl:
+    if _action_requires_template(payload.action_type, payload.send_email_after) and not tpl:
         raise HTTPException(status_code=400, detail="Selecione um template para a ação de envio")
 
     obj = CaktoAutomation(
@@ -387,6 +455,7 @@ def create_cakto_automation(
         action_type=payload.action_type,
         cakto_product_id=(payload.cakto_product_id or "").strip() or None,
         run_on_status_paid=bool(payload.run_on_status_paid),
+        send_email_after=bool(payload.send_email_after),
         template_id=tpl.id if tpl else None,
     )
     db.add(obj)
@@ -424,11 +493,14 @@ def update_cakto_automation(
     if "run_on_status_paid" in data and data["run_on_status_paid"] is not None:
         obj.run_on_status_paid = bool(data["run_on_status_paid"])
 
+    if "send_email_after" in data and data["send_email_after"] is not None:
+        obj.send_email_after = bool(data["send_email_after"])
+
     if "template_id" in data:
         tpl = _ensure_template_or_400(db, company_id, data["template_id"])
         obj.template_id = tpl.id if tpl else None
 
-    if _action_requires_template(obj.action_type) and not obj.template_id:
+    if _action_requires_template(obj.action_type, obj.send_email_after) and not obj.template_id:
         raise HTTPException(status_code=400, detail="Selecione um template para a ação de envio")
 
     obj.updated_at = datetime.now(timezone.utc)

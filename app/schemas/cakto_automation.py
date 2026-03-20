@@ -7,7 +7,13 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 
-CaktoEventType = Literal["order_paid"]
+CaktoEventType = Literal[
+    "order_paid",
+    "order_created",
+    "order_refunded",
+    "subscription_renewed",
+]
+
 CaktoActionType = Literal[
     "sync_customer",
     "send_email",
@@ -22,6 +28,7 @@ class CaktoAutomationCreate(BaseModel):
     action_type: CaktoActionType = "sync_customer"
     cakto_product_id: Optional[str] = None
     run_on_status_paid: bool = True
+    send_email_after: bool = False
     template_id: Optional[UUID] = None
 
 
@@ -32,6 +39,7 @@ class CaktoAutomationUpdate(BaseModel):
     action_type: Optional[CaktoActionType] = None
     cakto_product_id: Optional[str] = None
     run_on_status_paid: Optional[bool] = None
+    send_email_after: Optional[bool] = None
     template_id: Optional[UUID] = None
 
 
@@ -46,6 +54,7 @@ class CaktoAutomationOut(BaseModel):
     action_type: CaktoActionType
     cakto_product_id: Optional[str] = None
     run_on_status_paid: bool
+    send_email_after: bool
     template_id: Optional[UUID] = None
     created_at: datetime
     updated_at: datetime

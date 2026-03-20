@@ -288,6 +288,37 @@ def sync_customers_from_orders_query(
         "matched_pairs": matched_pairs,
     }
 
+@router.get("/products", status_code=status.HTTP_200_OK)
+def list_cakto_products(
+    company_id: UUID,
+    db: Session = Depends(get_db),
+):
+    _get_company_or_404(db, company_id)
+
+    items = (
+        db.query(CaktoProduct)
+        .filter(CaktoProduct.company_id == company_id)
+        .order_by(CaktoProduct.name.asc().nullslast(), CaktoProduct.created_at.desc())
+        .all()
+    )
+
+    return {
+        "ok": True,
+        "items": [
+            {
+                "id": str(item.id),
+                "cakto_product_id": item.cakto_product_id,
+                "name": item.name,
+                "product_type": item.product_type,
+                "status": item.status,
+                "category": item.category,
+                "price": str(item.price) if item.price is not None else None,
+                "currency": item.currency,
+                "active": item.active,
+            }
+            for item in items
+        ],
+    }
 
 @router.get("/overview", response_model=CaktoOverviewOut, status_code=status.HTTP_200_OK)
 def get_cakto_overview(

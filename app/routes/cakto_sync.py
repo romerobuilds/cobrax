@@ -319,7 +319,7 @@ def list_cakto_products(
             for item in items
         ],
     }
-
+    
 @router.get("/overview", response_model=CaktoOverviewOut, status_code=status.HTTP_200_OK)
 def get_cakto_overview(
     company_id: UUID,

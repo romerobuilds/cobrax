@@ -8,7 +8,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 CaktoEventType = Literal["order_paid"]
-CaktoActionType = Literal["sync_customer"]
+CaktoActionType = Literal[
+    "sync_customer",
+    "send_email",
+    "sync_customer_and_send_email",
+]
 
 
 class CaktoAutomationCreate(BaseModel):
@@ -18,8 +22,6 @@ class CaktoAutomationCreate(BaseModel):
     action_type: CaktoActionType = "sync_customer"
     cakto_product_id: Optional[str] = None
     run_on_status_paid: bool = True
-
-    send_email_after: bool = False
     template_id: Optional[UUID] = None
 
 
@@ -30,8 +32,6 @@ class CaktoAutomationUpdate(BaseModel):
     action_type: Optional[CaktoActionType] = None
     cakto_product_id: Optional[str] = None
     run_on_status_paid: Optional[bool] = None
-
-    send_email_after: Optional[bool] = None
     template_id: Optional[UUID] = None
 
 
@@ -46,10 +46,7 @@ class CaktoAutomationOut(BaseModel):
     action_type: CaktoActionType
     cakto_product_id: Optional[str] = None
     run_on_status_paid: bool
-
-    send_email_after: bool = False
     template_id: Optional[UUID] = None
-
     created_at: datetime
     updated_at: datetime
     last_run_at: Optional[datetime] = None
@@ -64,5 +61,4 @@ class CaktoAutomationRunResultOut(BaseModel):
     skipped_no_email: int = 0
     skipped_unchanged: int = 0
     emails_queued: int = 0
-    emails_skipped_duplicate: int = 0
     message: str = ""

@@ -28,6 +28,7 @@ ALLOWED_TEMPLATE_VARS = {
     "utm_campaign",
 }
 
+
 def build_default_context(*, company, client, extra: Dict[str, Any] | None = None) -> Dict[str, Any]:
     ctx = {
         "nome": getattr(client, "nome", None),

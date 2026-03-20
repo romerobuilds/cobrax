@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 import re
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import func
@@ -237,6 +238,14 @@ def _build_order_context(order: CaktoOrder) -> dict:
     }
 
 
+def _action_syncs_customer(action_type: str | None) -> bool:
+    return action_type in {"sync_customer", "sync_customer_and_send_email"}
+
+
+def _action_sends_email(action_type: str | None) -> bool:
+    return action_type in {"send_email", "sync_customer_and_send_email"}
+
+
 def _sync_customers_from_orders(
     *,
     db,
@@ -365,55 +374,45 @@ def _sync_customers_from_orders(
     }
 
 
-def _queue_automation_emails(
+def _queue_automation_emails_from_orders(
     *,
     db,
     company: Company,
     company_id,
     template: EmailTemplate,
-    matched_pairs: list,
+    orders: list[CaktoOrder],
 ) -> int:
     queued_log_ids: list[str] = []
     emails_queued = 0
-    seen_client_ids: set[str] = set()
+    seen_emails: set[str] = set()
 
-    for pair in matched_pairs or []:
-        client_id = pair.get("client_id")
-        order_id = pair.get("order_id")
-
-        if not client_id or not order_id:
+    for order in orders or []:
+        to_email = (getattr(order, "customer_email", None) or "").strip().lower()
+        if not to_email:
             continue
 
-        client_key = str(client_id)
-        if client_key in seen_client_ids:
+        if to_email in seen_emails:
             continue
-        seen_client_ids.add(client_key)
+        seen_emails.add(to_email)
 
-        client = (
+        existing_client = (
             db.query(Client)
             .filter(
                 Client.company_id == company_id,
-                Client.id == client_id,
+                Client.email == to_email,
             )
             .first()
         )
-        if not client or not (client.email or "").strip():
-            continue
 
-        order = (
-            db.query(CaktoOrder)
-            .filter(
-                CaktoOrder.company_id == company_id,
-                CaktoOrder.id == order_id,
-            )
-            .first()
+        runtime_client = existing_client or SimpleNamespace(
+            nome=(getattr(order, "customer_name", None) or to_email.split("@")[0]),
+            email=to_email,
+            telefone=getattr(order, "customer_phone", None),
         )
-        if not order:
-            continue
 
         ctx = build_default_context(
             company=company,
-            client=client,
+            client=runtime_client,
             extra=_build_order_context(order),
         )
 
@@ -428,11 +427,11 @@ def _queue_automation_emails(
 
         log = EmailLog(
             company_id=company_id,
-            client_id=client.id,
+            client_id=existing_client.id if existing_client else None,
             template_id=template.id,
             status="PENDING",
-            to_email=client.email,
-            to_name=client.nome,
+            to_email=to_email,
+            to_name=getattr(runtime_client, "nome", None),
             subject_rendered=rendered.subject,
             body_rendered=rendered.body,
             error_message=None,
@@ -455,9 +454,9 @@ def _run_company_cakto_automations(
     *,
     db,
     company: Company,
-    trigger_order_ids: list,
+    new_order_ids: list,
 ) -> Dict[str, Any]:
-    if not trigger_order_ids:
+    if not new_order_ids:
         return {
             "automations_processed": 0,
             "clients_created": 0,
@@ -491,7 +490,7 @@ def _run_company_cakto_automations(
     for obj in automations:
         orders_query = db.query(CaktoOrder).filter(
             CaktoOrder.company_id == company.id,
-            CaktoOrder.id.in_(trigger_order_ids),
+            CaktoOrder.id.in_(new_order_ids),
         )
 
         if obj.run_on_status_paid:
@@ -500,41 +499,70 @@ def _run_company_cakto_automations(
         if (obj.cakto_product_id or "").strip():
             orders_query = orders_query.filter(CaktoOrder.cakto_product_id == obj.cakto_product_id.strip())
 
-        if obj.action_type != "sync_customer":
-            continue
-
         matched_orders = orders_query.order_by(
             CaktoOrder.order_created_at.desc().nullslast(),
             CaktoOrder.created_at.desc(),
         ).all()
 
-        result = _sync_customers_from_orders(
-            db=db,
-            company=company,
-            company_id=company.id,
-            orders=matched_orders,
-        )
-
-        total_created += int(result["created"])
-        total_updated += int(result["updated"])
-
-        if obj.send_email_after and obj.template_id:
-            tpl = (
-                db.query(EmailTemplate)
-                .filter(
-                    EmailTemplate.company_id == company.id,
-                    EmailTemplate.id == obj.template_id,
-                )
-                .first()
+        if obj.action_type == "sync_customer":
+            result = _sync_customers_from_orders(
+                db=db,
+                company=company,
+                company_id=company.id,
+                orders=matched_orders,
             )
-            if tpl:
-                total_emails += _queue_automation_emails(
-                    db=db,
-                    company=company,
-                    company_id=company.id,
-                    template=tpl,
-                    matched_pairs=result.get("matched_pairs", []),
+            total_created += int(result["created"])
+            total_updated += int(result["updated"])
+
+        elif obj.action_type == "send_email":
+            if obj.template_id:
+                tpl = (
+                    db.query(EmailTemplate)
+                    .filter(
+                        EmailTemplate.company_id == company.id,
+                        EmailTemplate.id == obj.template_id,
+                    )
+                    .first()
                 )
+                if tpl:
+                    total_emails += _queue_automation_emails_from_orders(
+                        db=db,
+                        company=company,
+                        company_id=company.id,
+                        template=tpl,
+                        orders=matched_orders,
+                    )
+
+        elif obj.action_type == "sync_customer_and_send_email":
+            result = _sync_customers_from_orders(
+                db=db,
+                company=company,
+                company_id=company.id,
+                orders=matched_orders,
+            )
+            total_created += int(result["created"])
+            total_updated += int(result["updated"])
+
+            if obj.template_id:
+                tpl = (
+                    db.query(EmailTemplate)
+                    .filter(
+                        EmailTemplate.company_id == company.id,
+                        EmailTemplate.id == obj.template_id,
+                    )
+                    .first()
+                )
+                if tpl:
+                    total_emails += _queue_automation_emails_from_orders(
+                        db=db,
+                        company=company,
+                        company_id=company.id,
+                        template=tpl,
+                        orders=matched_orders,
+                    )
+
+        else:
+            continue
 
         obj.last_run_at = datetime.now(timezone.utc)
         obj.updated_at = datetime.now(timezone.utc)
@@ -574,7 +602,7 @@ def _sync_company_cakto_pipeline(company_id: str) -> Dict[str, Any]:
 
         created = 0
         updated = 0
-        trigger_order_ids: list = []
+        new_order_ids: list = []
 
         for raw_item in result["items"]:
             norm = _normalize_order(raw_item)
@@ -592,9 +620,6 @@ def _sync_company_cakto_pipeline(company_id: str) -> Dict[str, Any]:
             )
 
             if existing:
-                old_status = str(existing.status or "").strip().lower()
-                new_status = str(norm["status"] or "").strip().lower()
-
                 existing.cakto_product_id = norm["cakto_product_id"]
                 existing.customer_name = norm["customer_name"]
                 existing.customer_email = norm["customer_email"]
@@ -615,9 +640,6 @@ def _sync_company_cakto_pipeline(company_id: str) -> Dict[str, Any]:
                 existing.raw_payload = norm["raw_payload"]
                 db.add(existing)
                 updated += 1
-
-                if old_status != "paid" and new_status == "paid":
-                    trigger_order_ids.append(existing.id)
             else:
                 obj = CaktoOrder(
                     company_id=company.id,
@@ -644,7 +666,7 @@ def _sync_company_cakto_pipeline(company_id: str) -> Dict[str, Any]:
                 db.add(obj)
                 db.flush()
                 created += 1
-                trigger_order_ids.append(obj.id)
+                new_order_ids.append(obj.id)
 
         company.cakto_last_sync_at = datetime.now(timezone.utc)
         db.add(company)
@@ -653,7 +675,7 @@ def _sync_company_cakto_pipeline(company_id: str) -> Dict[str, Any]:
         automation_result = _run_company_cakto_automations(
             db=db,
             company=company,
-            trigger_order_ids=trigger_order_ids,
+            new_order_ids=new_order_ids,
         )
 
         return {
@@ -662,7 +684,7 @@ def _sync_company_cakto_pipeline(company_id: str) -> Dict[str, Any]:
             "orders_created": int(created),
             "orders_updated": int(updated),
             "pages": int(result["pages"]),
-            "orders_triggered_for_automation": int(len(trigger_order_ids)),
+            "new_orders_for_automation": int(len(new_order_ids)),
             "automations_processed": int(automation_result["automations_processed"]),
             "clients_created": int(automation_result["clients_created"]),
             "clients_updated": int(automation_result["clients_updated"]),

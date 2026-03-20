@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -110,80 +111,57 @@ def _build_order_context(order: CaktoOrder) -> dict:
     }
 
 
-def _already_has_equivalent_email_log(
-    *,
-    db: Session,
-    company_id: UUID,
-    client_id: UUID,
-    template_id: UUID,
-    subject_rendered: str,
-    body_rendered: str,
-) -> bool:
-    existing = (
-        db.query(EmailLog)
-        .filter(
-            EmailLog.company_id == company_id,
-            EmailLog.client_id == client_id,
-            EmailLog.template_id == template_id,
-            EmailLog.subject_rendered == subject_rendered,
-            EmailLog.body_rendered == body_rendered,
-            EmailLog.status.in_(["PENDING", "QUEUED", "SENDING", "SENT", "RETRYING", "DEFERRED"]),
-        )
-        .first()
-    )
-    return existing is not None
+def _action_syncs_customer(action_type: str | None) -> bool:
+    return action_type in {"sync_customer", "sync_customer_and_send_email"}
 
 
-def _queue_automation_emails(
+def _action_sends_email(action_type: str | None) -> bool:
+    return action_type in {"send_email", "sync_customer_and_send_email"}
+
+
+def _action_requires_template(action_type: str | None) -> bool:
+    return _action_sends_email(action_type)
+
+
+def _queue_automation_emails_from_orders(
     *,
     db: Session,
     company: Company,
     company_id: UUID,
     template: EmailTemplate,
-    matched_pairs: list,
-) -> tuple[int, int]:
+    orders: list[CaktoOrder],
+) -> int:
     queued_log_ids: list[str] = []
     emails_queued = 0
-    emails_skipped_duplicate = 0
-    seen_client_ids: set[str] = set()
+    seen_emails: set[str] = set()
 
-    for pair in matched_pairs or []:
-        client_id = pair.get("client_id")
-        order_id = pair.get("order_id")
-
-        if not client_id or not order_id:
+    for order in orders or []:
+        to_email = (getattr(order, "customer_email", None) or "").strip().lower()
+        if not to_email:
             continue
 
-        client_key = str(client_id)
-        if client_key in seen_client_ids:
+        if to_email in seen_emails:
             continue
-        seen_client_ids.add(client_key)
+        seen_emails.add(to_email)
 
-        client = (
+        existing_client = (
             db.query(Client)
             .filter(
                 Client.company_id == company_id,
-                Client.id == client_id,
+                Client.email == to_email,
             )
             .first()
         )
-        if not client or not (client.email or "").strip():
-            continue
 
-        order = (
-            db.query(CaktoOrder)
-            .filter(
-                CaktoOrder.company_id == company_id,
-                CaktoOrder.id == order_id,
-            )
-            .first()
+        runtime_client = existing_client or SimpleNamespace(
+            nome=(getattr(order, "customer_name", None) or to_email.split("@")[0]),
+            email=to_email,
+            telefone=getattr(order, "customer_phone", None),
         )
-        if not order:
-            continue
 
         ctx = build_default_context(
             company=company,
-            client=client,
+            client=runtime_client,
             extra=_build_order_context(order),
         )
 
@@ -196,24 +174,13 @@ def _queue_automation_emails(
         except Exception:
             continue
 
-        if _already_has_equivalent_email_log(
-            db=db,
-            company_id=company_id,
-            client_id=client.id,
-            template_id=template.id,
-            subject_rendered=rendered.subject,
-            body_rendered=rendered.body,
-        ):
-            emails_skipped_duplicate += 1
-            continue
-
         log = EmailLog(
             company_id=company_id,
-            client_id=client.id,
+            client_id=existing_client.id if existing_client else None,
             template_id=template.id,
             status="PENDING",
-            to_email=client.email,
-            to_name=client.nome,
+            to_email=to_email,
+            to_name=getattr(runtime_client, "nome", None),
             subject_rendered=rendered.subject,
             body_rendered=rendered.body,
             error_message=None,
@@ -229,7 +196,7 @@ def _queue_automation_emails(
     for log_id in queued_log_ids:
         send_email_job.delay(log_id)
 
-    return emails_queued, emails_skipped_duplicate
+    return emails_queued
 
 
 def _build_orders_query_for_automation(base_query, automation: CaktoAutomation):
@@ -252,39 +219,66 @@ def _run_single_automation(
     automation: CaktoAutomation,
     base_orders_query,
 ):
-    if automation.action_type != "sync_customer":
-        return {
-            "matched_orders": 0,
-            "created": 0,
-            "updated": 0,
-            "skipped_no_email": 0,
-            "skipped_unchanged": 0,
-            "emails_queued": 0,
-            "emails_skipped_duplicate": 0,
-        }
-
     filtered_query = _build_orders_query_for_automation(base_orders_query, automation)
 
-    result = sync_customers_from_orders_query(
-        db=db,
-        company_id=company_id,
-        company=company,
-        orders_query=filtered_query,
-    )
+    orders = filtered_query.order_by(
+        CaktoOrder.order_created_at.desc().nullslast(),
+        CaktoOrder.created_at.desc(),
+    ).all()
 
+    matched_orders = len(orders)
+    created = 0
+    updated = 0
+    skipped_no_email = 0
+    skipped_unchanged = 0
     emails_queued = 0
-    emails_skipped_duplicate = 0
 
-    if automation.send_email_after and automation.template_id:
+    if automation.action_type == "sync_customer":
+        result = sync_customers_from_orders_query(
+            db=db,
+            company_id=company_id,
+            company=company,
+            orders_query=filtered_query,
+        )
+        created = int(result["created"])
+        updated = int(result["updated"])
+        skipped_no_email = int(result["skipped_no_email"])
+        skipped_unchanged = int(result["skipped_unchanged"])
+
+    elif automation.action_type == "send_email":
         tpl = _ensure_template_or_400(db, company_id, automation.template_id)
         if tpl:
-            emails_queued, emails_skipped_duplicate = _queue_automation_emails(
+            emails_queued = _queue_automation_emails_from_orders(
                 db=db,
                 company=company,
                 company_id=company_id,
                 template=tpl,
-                matched_pairs=result.get("matched_pairs", []),
+                orders=orders,
             )
+
+    elif automation.action_type == "sync_customer_and_send_email":
+        result = sync_customers_from_orders_query(
+            db=db,
+            company_id=company_id,
+            company=company,
+            orders_query=filtered_query,
+        )
+        created = int(result["created"])
+        updated = int(result["updated"])
+        skipped_no_email = int(result["skipped_no_email"])
+        skipped_unchanged = int(result["skipped_unchanged"])
+
+        tpl = _ensure_template_or_400(db, company_id, automation.template_id)
+        if tpl:
+            emails_queued = _queue_automation_emails_from_orders(
+                db=db,
+                company=company,
+                company_id=company_id,
+                template=tpl,
+                orders=orders,
+            )
+    else:
+        raise HTTPException(status_code=400, detail="Ação da automação ainda não suportada")
 
     automation.last_run_at = datetime.now(timezone.utc)
     automation.updated_at = datetime.now(timezone.utc)
@@ -293,13 +287,12 @@ def _run_single_automation(
     db.refresh(automation)
 
     return {
-        "matched_orders": result["scanned_orders"],
-        "created": result["created"],
-        "updated": result["updated"],
-        "skipped_no_email": result["skipped_no_email"],
-        "skipped_unchanged": result["skipped_unchanged"],
+        "matched_orders": matched_orders,
+        "created": created,
+        "updated": updated,
+        "skipped_no_email": skipped_no_email,
+        "skipped_unchanged": skipped_unchanged,
         "emails_queued": emails_queued,
-        "emails_skipped_duplicate": emails_skipped_duplicate,
     }
 
 
@@ -326,7 +319,6 @@ def run_matching_cakto_automations(
             "automation_clients_created": 0,
             "automation_clients_updated": 0,
             "automation_emails_queued": 0,
-            "automation_emails_skipped_duplicate": 0,
         }
 
     base_orders_query = db.query(CaktoOrder).filter(CaktoOrder.company_id == company_id)
@@ -337,7 +329,6 @@ def run_matching_cakto_automations(
     total_created = 0
     total_updated = 0
     total_emails_queued = 0
-    total_emails_skipped_duplicate = 0
 
     for automation in automations:
         result = _run_single_automation(
@@ -351,14 +342,12 @@ def run_matching_cakto_automations(
         total_created += int(result.get("created", 0))
         total_updated += int(result.get("updated", 0))
         total_emails_queued += int(result.get("emails_queued", 0))
-        total_emails_skipped_duplicate += int(result.get("emails_skipped_duplicate", 0))
 
     return {
         "automation_runs": total_runs,
         "automation_clients_created": total_created,
         "automation_clients_updated": total_updated,
         "automation_emails_queued": total_emails_queued,
-        "automation_emails_skipped_duplicate": total_emails_skipped_duplicate,
     }
 
 
@@ -387,8 +376,8 @@ def create_cakto_automation(
 
     tpl = _ensure_template_or_400(db, company_id, payload.template_id)
 
-    if payload.send_email_after and not tpl:
-        raise HTTPException(status_code=400, detail="Selecione um template para envio automático")
+    if _action_requires_template(payload.action_type) and not tpl:
+        raise HTTPException(status_code=400, detail="Selecione um template para a ação de envio")
 
     obj = CaktoAutomation(
         company_id=company_id,
@@ -398,7 +387,6 @@ def create_cakto_automation(
         action_type=payload.action_type,
         cakto_product_id=(payload.cakto_product_id or "").strip() or None,
         run_on_status_paid=bool(payload.run_on_status_paid),
-        send_email_after=bool(payload.send_email_after),
         template_id=tpl.id if tpl else None,
     )
     db.add(obj)
@@ -436,15 +424,12 @@ def update_cakto_automation(
     if "run_on_status_paid" in data and data["run_on_status_paid"] is not None:
         obj.run_on_status_paid = bool(data["run_on_status_paid"])
 
-    if "send_email_after" in data and data["send_email_after"] is not None:
-        obj.send_email_after = bool(data["send_email_after"])
-
     if "template_id" in data:
         tpl = _ensure_template_or_400(db, company_id, data["template_id"])
         obj.template_id = tpl.id if tpl else None
 
-    if obj.send_email_after and not obj.template_id:
-        raise HTTPException(status_code=400, detail="Selecione um template para envio automático")
+    if _action_requires_template(obj.action_type) and not obj.template_id:
+        raise HTTPException(status_code=400, detail="Selecione um template para a ação de envio")
 
     obj.updated_at = datetime.now(timezone.utc)
 
@@ -497,6 +482,5 @@ def run_cakto_automation_now(
         skipped_no_email=result["skipped_no_email"],
         skipped_unchanged=result["skipped_unchanged"],
         emails_queued=result["emails_queued"],
-        emails_skipped_duplicate=result["emails_skipped_duplicate"],
         message="Automação executada com sucesso",
     )

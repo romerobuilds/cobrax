@@ -110,6 +110,30 @@ def _build_order_context(order: CaktoOrder) -> dict:
     }
 
 
+def _already_has_equivalent_email_log(
+    *,
+    db: Session,
+    company_id: UUID,
+    client_id: UUID,
+    template_id: UUID,
+    subject_rendered: str,
+    body_rendered: str,
+) -> bool:
+    existing = (
+        db.query(EmailLog)
+        .filter(
+            EmailLog.company_id == company_id,
+            EmailLog.client_id == client_id,
+            EmailLog.template_id == template_id,
+            EmailLog.subject_rendered == subject_rendered,
+            EmailLog.body_rendered == body_rendered,
+            EmailLog.status.in_(["PENDING", "QUEUED", "SENDING", "SENT", "RETRYING", "DEFERRED"]),
+        )
+        .first()
+    )
+    return existing is not None
+
+
 def _queue_automation_emails(
     *,
     db: Session,
@@ -117,9 +141,10 @@ def _queue_automation_emails(
     company_id: UUID,
     template: EmailTemplate,
     matched_pairs: list,
-) -> int:
+) -> tuple[int, int]:
     queued_log_ids: list[str] = []
     emails_queued = 0
+    emails_skipped_duplicate = 0
     seen_client_ids: set[str] = set()
 
     for pair in matched_pairs or []:
@@ -171,6 +196,17 @@ def _queue_automation_emails(
         except Exception:
             continue
 
+        if _already_has_equivalent_email_log(
+            db=db,
+            company_id=company_id,
+            client_id=client.id,
+            template_id=template.id,
+            subject_rendered=rendered.subject,
+            body_rendered=rendered.body,
+        ):
+            emails_skipped_duplicate += 1
+            continue
+
         log = EmailLog(
             company_id=company_id,
             client_id=client.id,
@@ -193,7 +229,7 @@ def _queue_automation_emails(
     for log_id in queued_log_ids:
         send_email_job.delay(log_id)
 
-    return emails_queued
+    return emails_queued, emails_skipped_duplicate
 
 
 def _build_orders_query_for_automation(base_query, automation: CaktoAutomation):
@@ -224,6 +260,7 @@ def _run_single_automation(
             "skipped_no_email": 0,
             "skipped_unchanged": 0,
             "emails_queued": 0,
+            "emails_skipped_duplicate": 0,
         }
 
     filtered_query = _build_orders_query_for_automation(base_orders_query, automation)
@@ -236,10 +273,12 @@ def _run_single_automation(
     )
 
     emails_queued = 0
+    emails_skipped_duplicate = 0
+
     if automation.send_email_after and automation.template_id:
         tpl = _ensure_template_or_400(db, company_id, automation.template_id)
         if tpl:
-            emails_queued = _queue_automation_emails(
+            emails_queued, emails_skipped_duplicate = _queue_automation_emails(
                 db=db,
                 company=company,
                 company_id=company_id,
@@ -260,6 +299,7 @@ def _run_single_automation(
         "skipped_no_email": result["skipped_no_email"],
         "skipped_unchanged": result["skipped_unchanged"],
         "emails_queued": emails_queued,
+        "emails_skipped_duplicate": emails_skipped_duplicate,
     }
 
 
@@ -286,6 +326,7 @@ def run_matching_cakto_automations(
             "automation_clients_created": 0,
             "automation_clients_updated": 0,
             "automation_emails_queued": 0,
+            "automation_emails_skipped_duplicate": 0,
         }
 
     base_orders_query = db.query(CaktoOrder).filter(CaktoOrder.company_id == company_id)
@@ -296,6 +337,7 @@ def run_matching_cakto_automations(
     total_created = 0
     total_updated = 0
     total_emails_queued = 0
+    total_emails_skipped_duplicate = 0
 
     for automation in automations:
         result = _run_single_automation(
@@ -309,12 +351,14 @@ def run_matching_cakto_automations(
         total_created += int(result.get("created", 0))
         total_updated += int(result.get("updated", 0))
         total_emails_queued += int(result.get("emails_queued", 0))
+        total_emails_skipped_duplicate += int(result.get("emails_skipped_duplicate", 0))
 
     return {
         "automation_runs": total_runs,
         "automation_clients_created": total_created,
         "automation_clients_updated": total_updated,
         "automation_emails_queued": total_emails_queued,
+        "automation_emails_skipped_duplicate": total_emails_skipped_duplicate,
     }
 
 
@@ -453,5 +497,6 @@ def run_cakto_automation_now(
         skipped_no_email=result["skipped_no_email"],
         skipped_unchanged=result["skipped_unchanged"],
         emails_queued=result["emails_queued"],
+        emails_skipped_duplicate=result["emails_skipped_duplicate"],
         message="Automação executada com sucesso",
     )

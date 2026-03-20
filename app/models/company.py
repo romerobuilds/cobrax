@@ -57,6 +57,14 @@ class Company(Base):
     cakto_connected_at = Column(DateTime(timezone=True), nullable=True)
     cakto_last_sync_at = Column(DateTime(timezone=True), nullable=True)
 
+    # webhook realtime
+    cakto_webhook_token = Column(String(80), nullable=True, unique=True)
+    cakto_webhook_id = Column(Integer, nullable=True)
+    cakto_webhook_secret = Column(String(255), nullable=True)
+    cakto_webhook_status = Column(String(50), nullable=True)
+    cakto_webhook_registered_at = Column(DateTime(timezone=True), nullable=True)
+    cakto_last_webhook_at = Column(DateTime(timezone=True), nullable=True)
+
     clients = relationship(
         "Client",
         back_populates="company",

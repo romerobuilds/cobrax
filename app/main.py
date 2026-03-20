@@ -37,6 +37,8 @@ from app.routes.asaas_settings import router as asaas_settings_router
 from app.routes.cakto_settings import router as cakto_settings_router
 from app.routes.cakto_sync import router as cakto_sync_router
 from app.routes.cakto_automations import router as cakto_automations_router
+from app.models.cakto_webhook_event import CaktoWebhookEvent
+from app.routes.webhook_cakto import router as cakto_webhook_public_router
 
 app = FastAPI(
     title="COBRAX",
@@ -84,3 +86,4 @@ app.include_router(asaas_settings_router)
 app.include_router(cakto_settings_router)
 app.include_router(cakto_sync_router)
 app.include_router(cakto_automations_router)
+app.include_router(cakto_webhook_public_router)

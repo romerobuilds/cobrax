@@ -139,6 +139,20 @@ def list_orders_page(
     return resp.json() or {}
 
 
+def retrieve_order(
+    access_token: str,
+    order_id: str,
+    timeout: int = 20,
+) -> Dict[str, Any]:
+    resp = requests.get(
+        f"{CAKTO_API_BASE}/public_api/orders/{order_id}/",
+        headers=build_auth_headers(access_token),
+        timeout=timeout,
+    )
+    _raise_for_status_with_body(resp)
+    return resp.json() or {}
+
+
 def list_all_products(
     access_token: str,
     *,
@@ -194,3 +208,132 @@ def list_all_orders(
         "items": items,
         "pages": pages,
     }
+
+
+# =========================
+# WEBHOOKS
+# =========================
+
+def list_webhooks(
+    access_token: str,
+    *,
+    search: str | None = None,
+    status: str | None = None,
+    page: int = 1,
+    limit: int = 100,
+    timeout: int = 20,
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {"page": page, "limit": limit}
+    if search:
+        params["search"] = search
+    if status:
+        params["status"] = status
+
+    resp = requests.get(
+        f"{CAKTO_API_BASE}/public_api/webhook/",
+        headers=build_auth_headers(access_token),
+        params=params,
+        timeout=timeout,
+    )
+    _raise_for_status_with_body(resp)
+    return resp.json() or {}
+
+
+def create_webhook(
+    access_token: str,
+    *,
+    name: str,
+    url: str,
+    products: list[str],
+    events: list[str],
+    status: str = "active",
+    timeout: int = 20,
+) -> Dict[str, Any]:
+    resp = requests.post(
+        f"{CAKTO_API_BASE}/public_api/webhook/",
+        headers=build_auth_headers(access_token),
+        json={
+            "name": name,
+            "url": url,
+            "products": products,
+            "events": events,
+            "status": status,
+        },
+        timeout=timeout,
+    )
+    _raise_for_status_with_body(resp)
+    return resp.json() or {}
+
+
+def update_webhook(
+    access_token: str,
+    webhook_id: int,
+    *,
+    name: str | None = None,
+    url: str | None = None,
+    products: list[str] | None = None,
+    events: list[str] | None = None,
+    status: str | None = None,
+    timeout: int = 20,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    if name is not None:
+        payload["name"] = name
+    if url is not None:
+        payload["url"] = url
+    if products is not None:
+        payload["products"] = products
+    if events is not None:
+        payload["events"] = events
+    if status is not None:
+        payload["status"] = status
+
+    resp = requests.put(
+        f"{CAKTO_API_BASE}/public_api/webhook/{webhook_id}/",
+        headers=build_auth_headers(access_token),
+        json=payload,
+        timeout=timeout,
+    )
+    _raise_for_status_with_body(resp)
+    return resp.json() or {}
+
+
+def retrieve_webhook(
+    access_token: str,
+    webhook_id: int,
+    timeout: int = 20,
+) -> Dict[str, Any]:
+    resp = requests.get(
+        f"{CAKTO_API_BASE}/public_api/webhook/{webhook_id}/",
+        headers=build_auth_headers(access_token),
+        timeout=timeout,
+    )
+    _raise_for_status_with_body(resp)
+    return resp.json() or {}
+
+
+def test_webhook_event(
+    access_token: str,
+    webhook_id: int,
+    timeout: int = 20,
+) -> Dict[str, Any]:
+    resp = requests.post(
+        f"{CAKTO_API_BASE}/public_api/webhook/event_test/{webhook_id}/",
+        headers=build_auth_headers(access_token),
+        timeout=timeout,
+    )
+    _raise_for_status_with_body(resp)
+    return resp.json() or {}
+
+
+def delete_webhook(
+    access_token: str,
+    webhook_id: int,
+    timeout: int = 20,
+) -> None:
+    resp = requests.delete(
+        f"{CAKTO_API_BASE}/public_api/webhook/{webhook_id}/",
+        headers=build_auth_headers(access_token),
+        timeout=timeout,
+    )
+    _raise_for_status_with_body(resp)

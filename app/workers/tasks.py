@@ -1,4 +1,7 @@
 # app/workers/tasks.py
+import json
+import hashlib
+
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
@@ -32,6 +35,8 @@ from app.services.asaas_client import download_url_as_bytes
 from app.services.cakto_client import get_access_token, list_all_orders
 from app.core.template_vars import build_default_context
 from app.services.template_renderer import render_email_template
+from app.models.cakto_webhook_event import CaktoWebhookEvent
+from app.services.cakto_client import get_access_token, list_all_orders, retrieve_order
 
 
 def _same_utc_day(dt) -> bool:
@@ -237,14 +242,234 @@ def _build_order_context(order: CaktoOrder) -> dict:
         "descricao": getattr(order, "offer_type", None) or "Pedido importado da Cakto",
     }
 
+def _get_source_event_from_payload(raw: dict | None) -> str | None:
+    raw = raw or {}
+    event = raw.get("event")
+    if isinstance(event, dict):
+        val = event.get("custom_id") or event.get("name") or event.get("id")
+        return str(val).strip().lower() if val is not None else None
+
+    for key in ("_cobrax_source_event", "custom_id", "event_type", "event", "type"):
+        val = raw.get(key)
+        if val is not None:
+            return str(val).strip().lower()
+
+    return None
+
+
+def _is_subscription_renewed(order: CaktoOrder) -> bool:
+    raw = getattr(order, "raw_payload", None) or {}
+    source_event = _get_source_event_from_payload(raw)
+    if source_event == "subscription_renewed":
+        return True
+
+    offer_type = str(getattr(order, "offer_type", None) or "").strip().lower()
+    status = str(getattr(order, "status", None) or "").strip().lower()
+
+    direct_flags = [
+        raw.get("subscription_renewed"),
+        raw.get("is_subscription_renewed"),
+        raw.get("renewed"),
+        raw.get("isRenewal"),
+        raw.get("renewal"),
+    ]
+    if any(bool(v) for v in direct_flags):
+        return True
+
+    recurrence_number = raw.get("recurrence_number") or raw.get("recurrenceNumber")
+    try:
+        if recurrence_number is not None and int(recurrence_number) > 1:
+            return True
+    except Exception:
+        pass
+
+    text_blob = " ".join(
+        [
+            offer_type,
+            status,
+            str(raw.get("type") or ""),
+            str(raw.get("event") or ""),
+            str(raw.get("billing_type") or ""),
+            str(raw.get("offer_type") or ""),
+            str(raw.get("offerType") or ""),
+            str(raw.get("description") or ""),
+        ]
+    ).lower()
+
+    looks_subscription = any(
+        token in text_blob
+        for token in [
+            "subscription",
+            "assinatura",
+            "recorr",
+            "renew",
+            "renov",
+        ]
+    )
+
+    if looks_subscription and (
+        status == "paid" or getattr(order, "paid_at", None) is not None
+    ):
+        return True
+
+    return False
+
+
+def _event_matches_order(automation: CaktoAutomation, order: CaktoOrder) -> bool:
+    event_type = str(getattr(automation, "event_type", "order_paid") or "order_paid").strip().lower()
+    raw = getattr(order, "raw_payload", None) or {}
+    source_event = _get_source_event_from_payload(raw)
+
+    if event_type == "order_created":
+        if source_event:
+            return source_event in {
+                "initiate_checkout",
+                "pix_gerado",
+                "boleto_gerado",
+                "picpay_gerado",
+                "openfinance_nubank_gerado",
+                "subscription_created",
+            }
+        return True
+
+    if event_type == "order_paid":
+        if source_event:
+            return source_event == "purchase_approved"
+        status = str(getattr(order, "status", None) or "").strip().lower()
+        return status == "paid" or getattr(order, "paid_at", None) is not None
+
+    if event_type == "order_refunded":
+        if source_event:
+            return source_event in {"refund", "chargeback"}
+        status = str(getattr(order, "status", None) or "").strip().lower()
+        return status == "refunded" or getattr(order, "refunded_at", None) is not None
+
+    if event_type == "subscription_renewed":
+        return _is_subscription_renewed(order)
+
+    return False
+
+
+def _automation_matches_product(automation: CaktoAutomation, order: CaktoOrder) -> bool:
+    wanted = str(getattr(automation, "cakto_product_id", None) or "").strip()
+    if not wanted:
+        return True
+    return str(getattr(order, "cakto_product_id", None) or "").strip() == wanted
+
+
+def _filter_orders_for_automation(automation: CaktoAutomation, orders: list[CaktoOrder]) -> list[CaktoOrder]:
+    out = []
+    for order in orders or []:
+        if not _automation_matches_product(automation, order):
+            continue
+        if not _event_matches_order(automation, order):
+            continue
+        out.append(order)
+    return out
+
+
+def _extract_order_id_from_webhook_payload(payload: dict) -> str | None:
+    candidates = [
+        payload,
+        payload.get("data") if isinstance(payload.get("data"), dict) else {},
+        payload.get("order") if isinstance(payload.get("order"), dict) else {},
+        payload.get("purchase") if isinstance(payload.get("purchase"), dict) else {},
+    ]
+
+    for obj in candidates:
+        val = _pick(obj, "order_id", "id", "_id")
+        if val is not None:
+            s = str(val).strip()
+            if s:
+                return s
+
+    data = payload.get("data") or {}
+    order = data.get("order") if isinstance(data, dict) else {}
+    if isinstance(order, dict):
+        val = _pick(order, "id", "_id", "order_id")
+        if val is not None:
+            s = str(val).strip()
+            if s:
+                return s
+
+    return None
+
+
+def _upsert_company_cakto_order_from_raw(
+    *,
+    db,
+    company: Company,
+    raw_item: dict,
+) -> tuple[CaktoOrder, bool]:
+    norm = _normalize_order(raw_item)
+    external_id = norm["cakto_order_id"]
+    if not external_id:
+        raise RuntimeError("Payload da Cakto sem id de pedido")
+
+    existing = (
+        db.query(CaktoOrder)
+        .filter(
+            CaktoOrder.company_id == company.id,
+            CaktoOrder.cakto_order_id == external_id,
+        )
+        .first()
+    )
+
+    if existing:
+        existing.cakto_product_id = norm["cakto_product_id"]
+        existing.customer_name = norm["customer_name"]
+        existing.customer_email = norm["customer_email"]
+        existing.customer_phone = norm["customer_phone"]
+        existing.doc_number = norm["doc_number"]
+        existing.status = norm["status"]
+        existing.payment_method = norm["payment_method"]
+        existing.amount = norm["amount"]
+        existing.currency = norm["currency"]
+        existing.offer_type = norm["offer_type"]
+        existing.utm_source = norm["utm_source"]
+        existing.utm_medium = norm["utm_medium"]
+        existing.utm_campaign = norm["utm_campaign"]
+        existing.paid_at = norm["paid_at"]
+        existing.canceled_at = norm["canceled_at"]
+        existing.refunded_at = norm["refunded_at"]
+        existing.order_created_at = norm["order_created_at"]
+        existing.raw_payload = norm["raw_payload"]
+        db.add(existing)
+        db.flush()
+        return existing, False
+
+    obj = CaktoOrder(
+        company_id=company.id,
+        cakto_order_id=external_id,
+        cakto_product_id=norm["cakto_product_id"],
+        customer_name=norm["customer_name"],
+        customer_email=norm["customer_email"],
+        customer_phone=norm["customer_phone"],
+        doc_number=norm["doc_number"],
+        status=norm["status"],
+        payment_method=norm["payment_method"],
+        amount=norm["amount"],
+        currency=norm["currency"],
+        offer_type=norm["offer_type"],
+        utm_source=norm["utm_source"],
+        utm_medium=norm["utm_medium"],
+        utm_campaign=norm["utm_campaign"],
+        paid_at=norm["paid_at"],
+        canceled_at=norm["canceled_at"],
+        refunded_at=norm["refunded_at"],
+        order_created_at=norm["order_created_at"],
+        raw_payload=norm["raw_payload"],
+    )
+    db.add(obj)
+    db.flush()
+    return obj, True
 
 def _action_syncs_customer(action_type: str | None) -> bool:
     return action_type in {"sync_customer", "sync_customer_and_send_email"}
 
 
-def _action_sends_email(action_type: str | None) -> bool:
-    return action_type in {"send_email", "sync_customer_and_send_email"}
-
+def _action_sends_email(action_type: str | None, send_email_after: bool | None = None) -> bool:
+    return bool(send_email_after) or action_type in {"send_email", "sync_customer_and_send_email"}
 
 def _sync_customers_from_orders(
     *,
@@ -482,29 +707,28 @@ def _run_company_cakto_automations(
             "emails_queued": 0,
         }
 
+    candidate_orders = (
+        db.query(CaktoOrder)
+        .filter(
+            CaktoOrder.company_id == company.id,
+            CaktoOrder.id.in_(new_order_ids),
+        )
+        .order_by(
+            CaktoOrder.order_created_at.desc().nullslast(),
+            CaktoOrder.created_at.desc(),
+        )
+        .all()
+    )
+
     total_created = 0
     total_updated = 0
     total_emails = 0
     processed = 0
 
     for obj in automations:
-        orders_query = db.query(CaktoOrder).filter(
-            CaktoOrder.company_id == company.id,
-            CaktoOrder.id.in_(new_order_ids),
-        )
+        matched_orders = _filter_orders_for_automation(obj, candidate_orders)
 
-        if obj.run_on_status_paid:
-            orders_query = orders_query.filter(CaktoOrder.status.ilike("paid"))
-
-        if (obj.cakto_product_id or "").strip():
-            orders_query = orders_query.filter(CaktoOrder.cakto_product_id == obj.cakto_product_id.strip())
-
-        matched_orders = orders_query.order_by(
-            CaktoOrder.order_created_at.desc().nullslast(),
-            CaktoOrder.created_at.desc(),
-        ).all()
-
-        if obj.action_type == "sync_customer":
+        if _action_syncs_customer(obj.action_type):
             result = _sync_customers_from_orders(
                 db=db,
                 company=company,
@@ -514,7 +738,7 @@ def _run_company_cakto_automations(
             total_created += int(result["created"])
             total_updated += int(result["updated"])
 
-        elif obj.action_type == "send_email":
+        if _action_sends_email(obj.action_type, getattr(obj, "send_email_after", False)):
             if obj.template_id:
                 tpl = (
                     db.query(EmailTemplate)
@@ -532,37 +756,6 @@ def _run_company_cakto_automations(
                         template=tpl,
                         orders=matched_orders,
                     )
-
-        elif obj.action_type == "sync_customer_and_send_email":
-            result = _sync_customers_from_orders(
-                db=db,
-                company=company,
-                company_id=company.id,
-                orders=matched_orders,
-            )
-            total_created += int(result["created"])
-            total_updated += int(result["updated"])
-
-            if obj.template_id:
-                tpl = (
-                    db.query(EmailTemplate)
-                    .filter(
-                        EmailTemplate.company_id == company.id,
-                        EmailTemplate.id == obj.template_id,
-                    )
-                    .first()
-                )
-                if tpl:
-                    total_emails += _queue_automation_emails_from_orders(
-                        db=db,
-                        company=company,
-                        company_id=company.id,
-                        template=tpl,
-                        orders=matched_orders,
-                    )
-
-        else:
-            continue
 
         obj.last_run_at = datetime.now(timezone.utc)
         obj.updated_at = datetime.now(timezone.utc)
@@ -924,6 +1117,115 @@ def run_due_campaigns_job():
 def sync_cakto_company_job(company_id: str):
     return _sync_company_cakto_pipeline(company_id)
 
+@celery_app.task(name="cakto.process_webhook_event")
+def process_cakto_webhook_event_job(event_id: str):
+    db = SessionLocal()
+    try:
+        row: CaktoWebhookEvent | None = db.query(CaktoWebhookEvent).filter(CaktoWebhookEvent.id == event_id).first()
+        if not row:
+            return {"ok": False, "error": "Evento webhook não encontrado", "event_id": event_id}
+
+        if row.status == "PROCESSED":
+            return {"ok": True, "skipped": True, "reason": "already_processed", "event_id": event_id}
+
+        company: Company | None = db.query(Company).filter(Company.id == row.company_id).first()
+        if not company:
+            row.status = "FAILED"
+            row.error_message = "Empresa não encontrada"
+            db.add(row)
+            db.commit()
+            return {"ok": False, "error": "Empresa não encontrada", "event_id": event_id}
+
+        row.status = "PROCESSING"
+        db.add(row)
+        db.commit()
+
+        payload = row.payload or {}
+        source_event = _get_source_event_from_payload(payload)
+        external_order_id = _extract_order_id_from_webhook_payload(payload)
+
+        client_id = (company.cakto_client_id or "").strip()
+        client_secret = (company.cakto_client_secret or "").strip()
+
+        if not client_id or not client_secret:
+            raise RuntimeError("Credenciais da Cakto ausentes na empresa")
+
+        token_data = get_access_token(client_id=client_id, client_secret=client_secret)
+        access_token = str(token_data.get("access_token") or "").strip()
+
+        raw_order = None
+        if external_order_id:
+            try:
+                raw_order = retrieve_order(access_token, external_order_id)
+            except Exception:
+                raw_order = None
+
+        if not isinstance(raw_order, dict) or not raw_order:
+            raw_order = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+
+        if not isinstance(raw_order, dict) or not raw_order:
+            row.status = "IGNORED"
+            row.error_message = "Não foi possível extrair dados do pedido do payload"
+            row.processed_at = datetime.now(timezone.utc)
+            db.add(row)
+            db.commit()
+            return {"ok": True, "ignored": True, "event_id": event_id}
+
+        raw_order["_cobrax_source_event"] = source_event
+
+        order, created = _upsert_company_cakto_order_from_raw(
+            db=db,
+            company=company,
+            raw_item=raw_order,
+        )
+
+        company.cakto_last_webhook_at = datetime.now(timezone.utc)
+        db.add(company)
+        db.commit()
+
+        automation_result = _run_company_cakto_automations(
+            db=db,
+            company=company,
+            new_order_ids=[order.id],
+        )
+
+        row.status = "PROCESSED"
+        row.processed_at = datetime.now(timezone.utc)
+        row.external_order_id = str(getattr(order, "cakto_order_id", None) or row.external_order_id or "")
+        db.add(row)
+        db.commit()
+
+        return {
+            "ok": True,
+            "event_id": event_id,
+            "order_id": str(order.id),
+            "order_created": bool(created),
+            "automations_processed": int(automation_result["automations_processed"]),
+            "clients_created": int(automation_result["clients_created"]),
+            "clients_updated": int(automation_result["clients_updated"]),
+            "emails_queued": int(automation_result["emails_queued"]),
+        }
+
+    except Exception as e:
+        db.rollback()
+        try:
+            row2 = db.query(CaktoWebhookEvent).filter(CaktoWebhookEvent.id == event_id).first()
+            if row2:
+                row2.status = "FAILED"
+                row2.error_message = str(e)
+                row2.processed_at = datetime.now(timezone.utc)
+                db.add(row2)
+                db.commit()
+        except Exception:
+            pass
+
+        return {
+            "ok": False,
+            "event_id": event_id,
+            "error": str(e),
+        }
+    finally:
+        db.close()
 
 @celery_app.task(name="cakto.sync_all_companies")
 def sync_all_cakto_companies_job():

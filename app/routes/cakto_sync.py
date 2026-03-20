@@ -298,13 +298,20 @@ def list_cakto_products(
     items = (
         db.query(CaktoProduct)
         .filter(CaktoProduct.company_id == company_id)
-        .order_by(CaktoProduct.name.asc().nullslast(), CaktoProduct.created_at.desc())
+        .order_by(CaktoProduct.created_at.desc())
         .all()
     )
 
-    return {
-        "ok": True,
-        "items": [
+    out = []
+    for item in items:
+        price = None
+        if getattr(item, "price", None) is not None:
+            try:
+                price = float(item.price)
+            except Exception:
+                price = None
+
+        out.append(
             {
                 "id": str(item.id),
                 "cakto_product_id": item.cakto_product_id,
@@ -312,13 +319,19 @@ def list_cakto_products(
                 "product_type": item.product_type,
                 "status": item.status,
                 "category": item.category,
-                "price": str(item.price) if item.price is not None else None,
+                "price": price,
                 "currency": item.currency,
                 "active": item.active,
+                "created_at": item.created_at.isoformat() if item.created_at else None,
+                "updated_at": item.updated_at.isoformat() if item.updated_at else None,
             }
-            for item in items
-        ],
-    }
+        )
+
+    print(f"[CAKTO PRODUCTS] company_id={company_id} total={len(out)}")
+    if out:
+        print(f"[CAKTO PRODUCTS] first={out[0]}")
+
+    return out
     
 @router.get("/overview", response_model=CaktoOverviewOut, status_code=status.HTTP_200_OK)
 def get_cakto_overview(

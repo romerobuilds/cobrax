@@ -1,8 +1,9 @@
 # app/workers/tasks.py
+from __future__ import annotations
+
 import json
 import hashlib
 
-from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation

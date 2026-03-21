@@ -38,7 +38,6 @@ CAKTO_WEBHOOK_EVENTS = [
     "boleto_gerado",
     "picpay_gerado",
     "openfinance_nubank_gerado",
-    "initiate_checkout",
 ]
 
 

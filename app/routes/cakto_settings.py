@@ -73,7 +73,7 @@ def _ensure_webhook_token(company: Company) -> str:
 
 def _build_webhook_url(company: Company) -> str:
     token = _ensure_webhook_token(company)
-    return f"{_public_base_url()}/webhooks/cakto/{token}"
+    return f"{_public_base_url()}/api/webhooks/cakto/{token}"
 
 
 def _cakto_out(company: Company) -> CaktoSettingsOut:
